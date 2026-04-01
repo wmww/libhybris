@@ -97,6 +97,9 @@ static locale_t hybris_locale;
 static int locale_inited = 0;
 static hybris_hook_cb hook_callback = NULL;
 
+/* Forward declaration -- defined later with bionic_tls allocation */
+void *_hybris_hook___get_tls_hooks(void);
+
 #ifdef WANT_ARM_TRACING
 static void (*_android_linker_init)(int sdk_version, void* (*get_hooked_symbol)(const char*, const char*), int enable_linker_gdb_support, hybris_tls_patcher_funcs_t* tls_patcher_funcs, void *(_create_wrapper)(const char*, void*, int), int wrapping_enabled) = NULL;
 #else
@@ -409,6 +412,24 @@ static pid_t _hybris_hook_gettid(void)
  *
  * */
 
+/* Wrapper for bionic threads: ensure bionic_tls is allocated before
+ * the bionic start_routine runs. */
+struct _hybris_thread_wrapper_args {
+    void *(*real_start)(void*);
+    void *real_arg;
+};
+
+static void *_hybris_thread_wrapper(void *wrapper_arg) {
+    struct _hybris_thread_wrapper_args args =
+        *(struct _hybris_thread_wrapper_args *)wrapper_arg;
+    free(wrapper_arg);
+
+    /* Force bionic_tls allocation for this thread */
+    _hybris_hook___get_tls_hooks();
+
+    return args.real_start(args.real_arg);
+}
+
 static int _hybris_hook_pthread_create(pthread_t *thread, const pthread_attr_t *__attr,
                              void *(*start_routine)(void*), void *arg)
 {
@@ -419,6 +440,16 @@ static int _hybris_hook_pthread_create(pthread_t *thread, const pthread_attr_t *
     if (__attr != NULL)
         realattr = (pthread_attr_t *) *(uintptr_t *) __attr;
 
+    /* Wrap start_routine to initialize bionic_tls on the new thread */
+    struct _hybris_thread_wrapper_args *wrapper_args =
+        malloc(sizeof(struct _hybris_thread_wrapper_args));
+    if (wrapper_args) {
+        wrapper_args->real_start = start_routine;
+        wrapper_args->real_arg = arg;
+        return pthread_create(thread, realattr, _hybris_thread_wrapper, wrapper_args);
+    }
+
+    /* Fallback if malloc fails */
     return pthread_create(thread, realattr, start_routine, arg);
 }
 
@@ -2379,14 +2410,39 @@ __THROW int _hybris_hook___snprintf_chk (char *__restrict __s, size_t __n, int _
     return ret;
 }
 
+/* bionic_tls compatibility for stock (unpatched) Android firmware.
+ *
+ * The TLS thunk patcher redirects bionic code's TPIDR_EL0 reads to point
+ * at tls_area.slots[0]. Bionic's TLS_SLOT_BIONIC_TLS (slot -1, at TP-8)
+ * then reads tls_area.bionic_tls_ptr, which we populate with a pointer to
+ * a zero-filled struct. This satisfies bionic's locale/errno/etc accesses
+ * without needing patched firmware.
+ */
+#define BIONIC_TLS_COMPAT_SIZE 16384  /* 16KB, oversized for safety */
+
 static __attribute__((tls_model ("initial-exec")))
-       __thread void *tls_hooks[16];
+       __thread struct {
+    void *bionic_tls_ptr;   /* maps to bionic slot -1 (TLS_SLOT_BIONIC_TLS) */
+    void *slots[16];        /* slots 0-15 (OpenGL etc) */
+} tls_area;
+
+/* Legacy macro so existing code using tls_hooks still works */
+#define tls_hooks (tls_area.slots)
 
 __attribute__((__visibility__("default")))
 void *_hybris_hook___get_tls_hooks()
 {
     TRACE_HOOK("");
-    return tls_hooks;
+
+    /* Lazily allocate a bionic_tls struct for this thread */
+    if (__builtin_expect(tls_area.bionic_tls_ptr == NULL, 0)) {
+        void *btls = calloc(1, BIONIC_TLS_COMPAT_SIZE);
+        if (btls) {
+            tls_area.bionic_tls_ptr = btls;
+        }
+    }
+
+    return tls_area.slots;
 }
 
 struct __wrapped_atexit {
