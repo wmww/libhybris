@@ -17,8 +17,9 @@
 
 #include "tls_patcher.h"
 #include "logging.h"
-#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <libgen.h>
 #include <pthread.h>
@@ -26,90 +27,54 @@
 
 extern void* _hybris_hook___get_tls_hooks(void);
 
-/* Architecture-specific patch function */
-extern void hybris_patch_tls_arch(void* segment_addr, size_t segment_size, int tls_offset);
+/* Forward declarations for arch-specific functions (#included at bottom) */
+static void hybris_patch_tls_arch(void* segment_addr, size_t segment_size, int tls_offset);
+static size_t hybris_count_tls_arch(void* segment_addr, size_t segment_size);
 
-/* Simple thunk region tracking */
-#define MAX_THUNK_REGIONS 32
+/* Current thunk region. Only one is active at a time -- the linker registers
+ * a region for each library immediately before patching it. */
 static struct {
     void* start;
     size_t size;
     size_t used;
-} thunk_regions[MAX_THUNK_REGIONS];
-static int num_thunk_regions = 0;
+} current_thunk_region;
 static pthread_mutex_t thunk_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* Register a thunk region allocated by the linker */
 void hybris_register_thunk_region(void* start, size_t size) {
     pthread_mutex_lock(&thunk_mutex);
-
-    if (num_thunk_regions < MAX_THUNK_REGIONS) {
-        thunk_regions[num_thunk_regions].start = start;
-        thunk_regions[num_thunk_regions].size = size;
-        thunk_regions[num_thunk_regions].used = 0;
-        num_thunk_regions++;
-
-        HYBRIS_DEBUG_LOG(HOOKS, "Registered thunk region: %p - %p (%zu bytes)",
-                        start, (char*)start + size, size);
-    }
-
+    current_thunk_region.start = start;
+    current_thunk_region.size = size;
+    current_thunk_region.used = 0;
     pthread_mutex_unlock(&thunk_mutex);
 }
 
-/* Allocate a thunk near the target address */
-void* hybris_allocate_thunk_near(void* target_addr, size_t thunk_size) {
+/* Allocate a thunk from the current region. Aborts on failure -- the region
+ * is exactly sized by the counting pass, so running out is a bug. */
+static void* hybris_allocate_thunk_near(void* target_addr, size_t thunk_size) {
     pthread_mutex_lock(&thunk_mutex);
 
+    size_t aligned_size = (thunk_size + 15) & ~(size_t)15;
+
+    if (!current_thunk_region.start ||
+        current_thunk_region.used + aligned_size > current_thunk_region.size) {
+        fprintf(stderr, "HYBRIS: fatal: thunk region exhausted (used %zu / %zu, need %zu) for target %p\n",
+                current_thunk_region.used, current_thunk_region.size, aligned_size, target_addr);
+        abort();
+    }
+
+    void* result = (char*)current_thunk_region.start + current_thunk_region.used;
+
+    /* Verify within 128MB branch range */
     uintptr_t target = (uintptr_t)target_addr;
-    void* result = NULL;
-
-    /* Find the closest thunk region within branching distance (128MB for ARM64) */
-    for (int i = 0; i < num_thunk_regions; i++) {
-        uintptr_t region_addr = (uintptr_t)thunk_regions[i].start;
-        uintptr_t distance = (target > region_addr) ? (target - region_addr) : (region_addr - target);
-
-        if (distance > (128 * 1024 * 1024)) {
-            continue;
-        }
-
-        /* Align thunk size to 16-byte boundary */
-        size_t aligned_size = (thunk_size + 15) & ~15;
-
-        if (thunk_regions[i].used + aligned_size <= thunk_regions[i].size) {
-            result = (char*)thunk_regions[i].start + thunk_regions[i].used;
-            thunk_regions[i].used += aligned_size;
-
-            HYBRIS_DEBUG_LOG(HOOKS, "Allocated thunk at %p (size %zu) for target %p",
-                           result, thunk_size, target_addr);
-            break;
-        }
+    uintptr_t thunk = (uintptr_t)result;
+    uintptr_t distance = (target > thunk) ? (target - thunk) : (thunk - target);
+    if (distance > 128 * 1024 * 1024) {
+        fprintf(stderr, "HYBRIS: fatal: thunk at %p is %zuMB from target %p (max 128MB)\n",
+                result, distance / (1024 * 1024), target_addr);
+        abort();
     }
 
-    if (!result) {
-        HYBRIS_DEBUG_LOG(HOOKS, "Failed to allocate thunk for target %p - no suitable region found", target_addr);
-    }
-
-    pthread_mutex_unlock(&thunk_mutex);
-    return result;
-}
-
-/* Check if an address is within a thunk region */
-int hybris_is_within_thunk_region(void* addr) {
-    pthread_mutex_lock(&thunk_mutex);
-
-    uintptr_t check_addr = (uintptr_t)addr;
-    int result = 0;
-
-    for (int i = 0; i < num_thunk_regions; i++) {
-        uintptr_t region_start = (uintptr_t)thunk_regions[i].start;
-        uintptr_t region_end = region_start + thunk_regions[i].size;
-
-        if (check_addr >= region_start && check_addr < region_end) {
-            result = 1;
-            break;
-        }
-    }
-
+    current_thunk_region.used += aligned_size;
     pthread_mutex_unlock(&thunk_mutex);
     return result;
 }
@@ -132,23 +97,19 @@ static int should_patch_library(const char* library_name) {
     static const char* patch_tls = NULL;
     static int init_done = 0;
 
-    /* Initialize on first call */
     if (!init_done) {
         patch_tls = getenv("HYBRIS_PATCH_TLS");
         init_done = 1;
     }
 
-    /* No environment variable set - do nothing */
-    if (!patch_tls) {
+    if (!patch_tls)
         return 0;
-    }
 
-    /* Simple enable/disable */
-    if (patch_tls[0] == '0' || patch_tls[0] == '1') {
+    /* "0" or "1": simple enable/disable */
+    if (patch_tls[0] == '0' || patch_tls[0] == '1')
         return patch_tls[0] == '1';
-    }
 
-    /* Check if library basename is in colon-separated list */
+    /* Colon-separated list of library basenames */
     const char *start = patch_tls;
     const char *name = get_basename(library_name);
     size_t name_len = strlen(name);
@@ -156,21 +117,21 @@ static int should_patch_library(const char* library_name) {
     while (start && *start) {
         const char *end = strchr(start, ':');
         size_t len = end ? (size_t)(end - start) : strlen(start);
-
-        if (len == name_len && strncmp(start, name, len) == 0) {
+        if (len == name_len && strncmp(start, name, len) == 0)
             return 1;
-        }
-
         start = end ? end + 1 : NULL;
     }
 
     return 0;
 }
 
+size_t hybris_count_tls(void* segment_addr, size_t segment_size) {
+    return hybris_count_tls_arch(segment_addr, segment_size);
+}
+
 void hybris_patch_tls(void* segment_addr, size_t segment_size, const char* library_name) {
-    if (!should_patch_library(library_name)) {
+    if (!should_patch_library(library_name))
         return;
-    }
 
     HYBRIS_DEBUG_LOG(HOOKS, "Patching TLS accesses in %s", library_name);
 

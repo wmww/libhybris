@@ -26,28 +26,23 @@ extern "C" {
 
 typedef void (*hybris_tls_patcher_t)(void* segment_addr, size_t segment_size, const char* library_name);
 typedef void (*hybris_register_thunk_region_t)(void* start, size_t size);
-typedef void* (*hybris_allocate_thunk_near_t)(void* target_addr, size_t thunk_size);
-typedef int (*hybris_is_within_thunk_region_t)(void* addr);
+typedef size_t (*hybris_count_tls_t)(void* segment_addr, size_t segment_size);
 
-/* Struct containing all TLS patcher function pointers */
+/* Function pointers passed from hooks.c to the Android linker */
 struct hybris_tls_patcher_funcs {
     hybris_tls_patcher_t patch_tls;
     hybris_register_thunk_region_t register_thunk_region;
-    hybris_allocate_thunk_near_t allocate_thunk_near;
-    hybris_is_within_thunk_region_t is_within_thunk_region;
+    hybris_count_tls_t count_tls;
 };
 typedef struct hybris_tls_patcher_funcs hybris_tls_patcher_funcs_t;
 
-/* Register a thunk region allocated by the linker */
+/* Register a thunk region for the current library being patched */
 void hybris_register_thunk_region(void* start, size_t size);
 
-/* Allocate a thunk near the target address */
-void* hybris_allocate_thunk_near(void* target_addr, size_t thunk_size);
+/* Count MRS TPIDR_EL0 instructions in a code segment */
+size_t hybris_count_tls(void* segment_addr, size_t segment_size);
 
-/* Check if an address is within a thunk region */
-int hybris_is_within_thunk_region(void* addr);
-
-/* Patches TLS accesses in the given segment at runtime */
+/* Patch TLS accesses in the given segment at runtime */
 void hybris_patch_tls(void* segment_addr, size_t segment_size, const char* library_name);
 
 #ifdef __cplusplus
