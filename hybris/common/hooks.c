@@ -3763,11 +3763,9 @@ static void __hybris_linker_init()
     /* Create TLS patcher function pointers struct */
     hybris_tls_patcher_funcs_t tls_patcher_funcs = {0};
 #ifdef __aarch64__
-    if (getenv("HYBRIS_PATCH_TLS") != NULL) {
-        tls_patcher_funcs.patch_tls = hybris_patch_tls;
-        tls_patcher_funcs.register_thunk_region = hybris_register_thunk_region;
-        tls_patcher_funcs.count_tls = hybris_count_tls;
-    }
+    tls_patcher_funcs.patch_tls = hybris_patch_tls;
+    tls_patcher_funcs.register_thunk_region = hybris_register_thunk_region;
+    tls_patcher_funcs.count_tls = hybris_count_tls;
 #endif
 
     /* Now its time to setup the linker itself */
