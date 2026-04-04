@@ -9,6 +9,10 @@ This allows us to load graphics drivers, or any other driver that's sitting
 inside an Android "so" file and utilize them in a non-Android-based
 Linux distribution.
 
+# This fork
+
+This fork is maintained as part of the [tawc](https://codeberg.org/sphi/tawc) project to allow using libhybris on unpatched Android. See [TAWC_FORK.md](TAWC_FORK.md) for details.
+
 # How to use libhybris
 
 In general Android is patched to remove TLS accesses in bionic c library which
