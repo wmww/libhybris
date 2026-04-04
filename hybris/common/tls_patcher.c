@@ -86,53 +86,11 @@ static int hybris_calculate_tls_offset(void) {
     return (int)((uintptr_t)tls_area - (uintptr_t)tp) / sizeof(uintptr_t);
 }
 
-/* Extract filename from path without modifying input */
-static const char* get_basename(const char* path) {
-    const char* base = strrchr(path, '/');
-    return base ? base + 1 : path;
-}
-
-/* Check if library should be patched based on HYBRIS_PATCH_TLS value */
-static int should_patch_library(const char* library_name) {
-    static const char* patch_tls = NULL;
-    static int init_done = 0;
-
-    if (!init_done) {
-        patch_tls = getenv("HYBRIS_PATCH_TLS");
-        init_done = 1;
-    }
-
-    if (!patch_tls)
-        return 0;
-
-    /* "0" or "1": simple enable/disable */
-    if (patch_tls[0] == '0' || patch_tls[0] == '1')
-        return patch_tls[0] == '1';
-
-    /* Colon-separated list of library basenames */
-    const char *start = patch_tls;
-    const char *name = get_basename(library_name);
-    size_t name_len = strlen(name);
-
-    while (start && *start) {
-        const char *end = strchr(start, ':');
-        size_t len = end ? (size_t)(end - start) : strlen(start);
-        if (len == name_len && strncmp(start, name, len) == 0)
-            return 1;
-        start = end ? end + 1 : NULL;
-    }
-
-    return 0;
-}
-
 size_t hybris_count_tls(void* segment_addr, size_t segment_size) {
     return hybris_count_tls_arch(segment_addr, segment_size);
 }
 
 void hybris_patch_tls(void* segment_addr, size_t segment_size, const char* library_name) {
-    if (!should_patch_library(library_name))
-        return;
-
     HYBRIS_DEBUG_LOG(HOOKS, "Patching TLS accesses in %s", library_name);
 
     int tls_offset = hybris_calculate_tls_offset();
