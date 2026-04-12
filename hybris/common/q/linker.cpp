@@ -81,6 +81,8 @@
 #include "../wrappers.h"
 #endif
 
+#include "cfi_bypass.h"
+
 #define TMPFS_MAGIC 0x01021994
 
 #define DF_1_PIE        0x08000000
@@ -1912,6 +1914,11 @@ bool find_libraries(android_namespace_t* ns,
             !get_cfi_shadow()->AfterLoad(si, solist_get_head())) {
           return false;
         }
+        // After each library is linked, retry the bionic libdl.so __cfi_slowpath
+        // patch. The first call from android_linker_init() is too early — libdl
+        // gets mapped only when something with DT_NEEDED on it is loaded. Once
+        // patched, subsequent calls are a static-flag no-op.
+        hybris_patch_bionic_cfi();
       }
 
       return true;
