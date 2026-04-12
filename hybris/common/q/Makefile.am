@@ -18,6 +18,7 @@ AM_CXXFLAGS = \
 	-Wold-style-cast
 
 q_la_SOURCES = \
+	cfi_bypass.c \
 	hybris_compat.cpp \
 	bionic/libc/bionic/bionic_call_ifunc_resolver.cpp \
 	dlfcn.cpp \
