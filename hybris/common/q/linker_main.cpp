@@ -64,6 +64,7 @@
 #include <vector>
 
 #include "../tls_patcher.h"
+#include "cfi_bypass.h"
 
 extern void __libc_init_globals(KernelArgumentBlock&);
 #ifdef DISABLED_FOR_HYBRIS_SUPPORT
@@ -839,4 +840,12 @@ extern "C" void android_linker_init(int sdk_version, void* (*get_hooked_symbol)(
 
   init_default_namespaces(get_executable_path());
   DEBUG("init_default_namespaces %d\n", sdk_version);
+
+  // Patch bionic's __cfi_slowpath to a no-op return. Vendor libraries loaded
+  // via hybris_dlopen are not registered in bionic's CFI shadow table (which
+  // was set up only for system libraries by the real bionic linker at process
+  // start), so any CFI-checked indirect call from vendor code would crash.
+  // Must run before the first hybris_dlopen of a vendor library; this function
+  // runs once at libhybris init, which is exactly that point.
+  hybris_patch_bionic_cfi();
 }
