@@ -52,6 +52,7 @@ public:
     void frame();
     void resize(unsigned int width, unsigned int height);
     void releaseBuffer(struct wl_buffer *buffer);
+    void drainOneQueuedBufferLocked();
 
     virtual int setSwapInterval(int interval);
     void prepareSwap(EGLint *damage_rects, EGLint damage_n_rects);
