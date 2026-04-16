@@ -32,6 +32,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
 
 #include "logging.h"
 #include <eglhybris.h>
@@ -175,32 +177,40 @@ void WaylandNativeWindow::finishSwap()
         wl_callback_add_listener(this->frame_callback, &frame_listener, this);
     }
 
-    WaylandNativeWindowBuffer *wnb = NULL;
-    if (!queue.empty()) {
-        wnb = queue.front();
-        queue.pop_front();
+    drainOneQueuedBufferLocked();
+    wl_surface_commit(wl_surface_wrapper);
+
+    if (this->frame_callback == NULL) {
+        this->frame_callback = wl_display_sync(wl_dpy_wrapper);
+        wl_callback_add_listener(this->frame_callback, &frame_listener, this);
     }
 
-    if (wnb) {
-        assert(wnb->busy == 1);
+    wl_display_flush(m_display);
+    unlock();
+}
 
-        if (!wnb->wlbuffer) {
-            wnb->init(m_android_wlegl, m_display, wl_queue);
-            TRACE("%p add listener with %p inside", wnb, wnb->wlbuffer);
-            wl_buffer_add_listener(wnb->wlbuffer, &wl_buffer_listener, this);
-        }
+static int debugenvchecked = 0;
 
-        wl_surface_attach(wl_surface_wrapper, wnb->wlbuffer, 0, 0);
+void WaylandNativeWindow::drainOneQueuedBufferLocked()
+{
+    if (!m_window) return;
+    if (queue.empty()) return;
 
-        m_window->attached_width = wnb->width;
-        m_window->attached_height = wnb->height;
+    WaylandNativeWindowBuffer *wnb = queue.front();
+    queue.pop_front();
+    assert(wnb->busy == 1);
 
-        fronted.push_back(wnb);
+    if (!wnb->wlbuffer) {
+        wnb->init(m_android_wlegl, m_display, wl_queue);
+        TRACE("%p add listener with %p inside", wnb, wnb->wlbuffer);
+        wl_buffer_add_listener(wnb->wlbuffer, &wl_buffer_listener, this);
     }
 
-    // If the compositor doesn't support damage_buffer, we deliberately
-    // ignore the damage region and post maximum damage, due to
-    // https://bugs.freedesktop.org/78190
+    wl_surface_attach(wl_surface_wrapper, wnb->wlbuffer, 0, 0);
+    m_window->attached_width = wnb->width;
+    m_window->attached_height = wnb->height;
+    fronted.push_back(wnb);
+
     if (wl_proxy_get_version((struct wl_proxy *) wl_surface_wrapper) >=
         WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION) {
         if (m_damage_n_rects > 0 && m_window->attached_height > 0) {
@@ -210,31 +220,19 @@ void WaylandNativeWindow::finishSwap()
                                          rect[0], m_window->attached_height - rect[1] - rect[3],
                                          rect[2], rect[3]);
             }
-        } else if (wnb) {
+        } else {
             wl_surface_damage_buffer(wl_surface_wrapper, 0, 0, INT32_MAX, INT32_MAX);
         }
-    } else if (wnb) {
+    } else {
         wl_surface_damage(wl_surface_wrapper, 0, 0, INT32_MAX, INT32_MAX);
     }
 
     wl_surface_commit(wl_surface_wrapper);
-
-    // If we're not waiting for a frame callback then we'll at least throttle
-    // to a sync callback so that we always give a chance for the compositor to
-    // handle the commit and send a release event before checking for a free buffer.
-    if (this->frame_callback == NULL) {
-        this->frame_callback = wl_display_sync(wl_dpy_wrapper);
-        wl_callback_add_listener(this->frame_callback, &frame_listener, this);
-    }
-
     wl_display_flush(m_display);
 
     m_damage_rects = NULL;
     m_damage_n_rects = 0;
-    unlock();
 }
-
-static int debugenvchecked = 0;
 
 int WaylandNativeWindow::queueBuffer(BaseNativeWindowBuffer* buffer, int fenceFd)
 {
@@ -267,6 +265,8 @@ int WaylandNativeWindow::queueBuffer(BaseNativeWindowBuffer* buffer, int fenceFd
     }
     HYBRIS_TRACE_END("wayland-platform", "queueBuffer_waiting_for_fence", "-%p", wnb);
 #endif
+
+    drainOneQueuedBufferLocked();
 
     HYBRIS_TRACE_COUNTER("wayland-platform", "fronted.size", "%i", fronted.size());
     HYBRIS_TRACE_END("wayland-platform", "queueBuffer", "-%p", wnb);
