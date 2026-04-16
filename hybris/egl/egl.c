@@ -548,6 +548,32 @@ struct FuncNamePair {
 #define OVERRIDE_MY(function) { .name = #function, .func = (__eglMustCastToProperFunctionPointerType) _my_ ## function }
 #define OVERRIDE_TO(function_from, function) { .name = #function_from, .func = (__eglMustCastToProperFunctionPointerType) function }
 
+/*
+ * EGL_EXT_device_query stubs. Android EGL has no notion of EGLDeviceEXT and
+ * never implements this extension, so eglGetProcAddress on Android returns
+ * NULL for these. Firefox's glxtest probe (toolkit/xre/glxtest/glxtest.cpp)
+ * null-checks the function pointers and bails ("libEGL missing methods for
+ * GL test" -> ERROR -> Feature::HW_COMPOSITING ForceDisable'd) if either is
+ * NULL, even though every consumer of the return values null-checks them.
+ *
+ * We expose stubs that honestly report "no device-query info available"
+ * (NULL string / EGL_FALSE). We do NOT advertise EGL_EXT_device_query in
+ * any extension string, so callers that respect the extension string still
+ * get truthful behaviour; only callers that bypass the extension string and
+ * dlsym-by-procaddr (like Firefox's probe) see the stubs.
+ */
+static const char * _my_eglQueryDeviceStringEXT(void *device, EGLint name)
+{
+	(void)device; (void)name;
+	return NULL;
+}
+
+static EGLBoolean _my_eglQueryDisplayAttribEXT(EGLDisplay dpy, EGLint attribute, intptr_t *value)
+{
+	(void)dpy; (void)attribute; (void)value;
+	return EGL_FALSE;
+}
+
 static struct FuncNamePair _eglHybrisOverrideFunctions[] = {
 	OVERRIDE_MY(eglCreateImageKHR),
 	OVERRIDE_MY(eglSwapBuffersWithDamageEXT),
@@ -595,6 +621,8 @@ static struct FuncNamePair _eglHybrisOverrideFunctions[] = {
 	OVERRIDE_TO(eglGetPlatformDisplayEXT, eglGetPlatformDisplay),
 	OVERRIDE_MY(eglCreatePlatformWindowSurfaceEXT),
 	OVERRIDE_TO(eglCreatePlatformPixmapSurfaceEXT, eglCreatePixmapSurface),
+	OVERRIDE_MY(eglQueryDeviceStringEXT),
+	OVERRIDE_MY(eglQueryDisplayAttribEXT),
 };
 static EGLBoolean _eglHybrisOverrideFunctions_sorted = EGL_FALSE;
 
