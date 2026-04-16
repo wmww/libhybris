@@ -42,9 +42,18 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <pthread.h>
 
 #include <dlfcn.h>
 #include "logging.h"
+
+// AHardwareBuffer backend. Public NDK API backed by libnativewindow.so, which
+// dispatches to whichever gralloc the system currently ships (gralloc4 on
+// modern Android). Using AHB gives us handle layouts that match what the
+// Android-side mapper expects, fixing cross-process buffer sharing on stock
+// firmware where GRALLOC1 / GRALLOC0 would produce handles the current
+// mapper rejects.
+#include <android/hardware_buffer.h>
 
 static int version = -1;
 static hw_module_t *gralloc_hardware_module = NULL;
@@ -83,6 +92,145 @@ static GRALLOC1_PFN_GET_LAYER_COUNT gralloc1_get_layer_count = NULL;
 static void gralloc1_init(void);
 #endif
 
+// ---------------------------------------------------------------------------
+// AHB backend state (version == 3)
+// ---------------------------------------------------------------------------
+
+typedef int    (*ahb_allocate_fn)(const AHardwareBuffer_Desc *, AHardwareBuffer **);
+typedef void   (*ahb_describe_fn)(const AHardwareBuffer *, AHardwareBuffer_Desc *);
+typedef int    (*ahb_lock_fn)(AHardwareBuffer *, uint64_t, int32_t, const ARect *, void **);
+typedef int    (*ahb_unlock_fn)(AHardwareBuffer *, int32_t *);
+typedef void   (*ahb_acquire_fn)(AHardwareBuffer *);
+typedef void   (*ahb_release_fn)(AHardwareBuffer *);
+typedef const native_handle_t * (*ahb_get_native_handle_fn)(const AHardwareBuffer *);
+typedef int    (*ahb_create_from_handle_fn)(const AHardwareBuffer_Desc *, const native_handle_t *, int32_t, AHardwareBuffer **);
+
+static void *ahb_libnativewindow = NULL;
+static ahb_allocate_fn           ahb_allocate_sym;
+static ahb_describe_fn           ahb_describe_sym;
+static ahb_lock_fn               ahb_lock_sym;
+static ahb_unlock_fn             ahb_unlock_sym;
+static ahb_acquire_fn            ahb_acquire_sym;
+static ahb_release_fn            ahb_release_sym;
+static ahb_get_native_handle_fn  ahb_get_native_handle_sym;
+static ahb_create_from_handle_fn ahb_create_from_handle_sym;
+
+// AHB method values for AHardwareBuffer_createFromHandle. Not in the public
+// NDK header; cribbed from AOSP frameworks/native/libs/nativewindow/include/
+// private/android/AHardwareBufferHelpers.h.
+#define AHB_METHOD_CLONE    1
+#define AHB_METHOD_REGISTER 2
+
+// Map native_handle_t* (returned by AHardwareBuffer_getNativeHandle) -> AHB
+// pointer + shadow refcount. AHB's own refcount is opaque, so we track it
+// ourselves to know when to remove the map entry.
+typedef struct ahb_entry {
+    const native_handle_t *handle;
+    AHardwareBuffer       *ahb;
+    int                    refcount;
+    struct ahb_entry      *next;
+} ahb_entry_t;
+
+static ahb_entry_t    *ahb_map_head = NULL;
+static pthread_mutex_t ahb_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void ahb_map_insert(const native_handle_t *handle, AHardwareBuffer *ahb) {
+    ahb_entry_t *e = (ahb_entry_t *)malloc(sizeof(*e));
+    if (!e) return;
+    e->handle   = handle;
+    e->ahb      = ahb;
+    e->refcount = 1;
+    pthread_mutex_lock(&ahb_map_mutex);
+    e->next = ahb_map_head;
+    ahb_map_head = e;
+    pthread_mutex_unlock(&ahb_map_mutex);
+}
+
+static AHardwareBuffer *ahb_map_find(const native_handle_t *handle) {
+    AHardwareBuffer *ahb = NULL;
+    pthread_mutex_lock(&ahb_map_mutex);
+    for (ahb_entry_t *e = ahb_map_head; e; e = e->next) {
+        if (e->handle == handle) { ahb = e->ahb; break; }
+    }
+    pthread_mutex_unlock(&ahb_map_mutex);
+    return ahb;
+}
+
+static int ahb_map_incref(const native_handle_t *handle) {
+    int rc = -ENOENT;
+    pthread_mutex_lock(&ahb_map_mutex);
+    for (ahb_entry_t *e = ahb_map_head; e; e = e->next) {
+        if (e->handle == handle) { e->refcount++; rc = 0; break; }
+    }
+    pthread_mutex_unlock(&ahb_map_mutex);
+    return rc;
+}
+
+// Decrement the shadow refcount.
+// Returns 0 and sets *out_ahb when the refcount hits zero (caller must
+// AHardwareBuffer_release), 1 when refs remain, or -ENOENT when the
+// handle is not in the map at all.
+static int ahb_map_decref_take(const native_handle_t *handle, AHardwareBuffer **out_ahb) {
+    int result = -ENOENT;
+    *out_ahb = NULL;
+    pthread_mutex_lock(&ahb_map_mutex);
+    ahb_entry_t **prev = &ahb_map_head;
+    for (ahb_entry_t *e = *prev; e; prev = &e->next, e = *prev) {
+        if (e->handle == handle) {
+            if (--e->refcount <= 0) {
+                *out_ahb = e->ahb;
+                *prev = e->next;
+                free(e);
+                result = 0;
+            } else {
+                result = 1;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ahb_map_mutex);
+    return result;
+}
+
+// Best-effort load of libnativewindow.so via the bionic linker. Returns 1 on
+// success, 0 on failure. On failure, the caller falls through to the
+// GRALLOC_COMPAT / GRALLOC1 / GRALLOC0 init chain.
+static int ahb_init(void) {
+#ifdef ANDROID_BUILD
+    ahb_libnativewindow = dlopen("libnativewindow.so", RTLD_NOW);
+#else
+    ahb_libnativewindow = android_dlopen("libnativewindow.so", RTLD_NOW);
+#endif
+    if (!ahb_libnativewindow) {
+        return 0;
+    }
+
+#ifdef ANDROID_BUILD
+#define AHB_DLSYM(sym) dlsym(ahb_libnativewindow, sym)
+#else
+#define AHB_DLSYM(sym) android_dlsym(ahb_libnativewindow, sym)
+#endif
+    ahb_allocate_sym           = (ahb_allocate_fn)          AHB_DLSYM("AHardwareBuffer_allocate");
+    ahb_describe_sym           = (ahb_describe_fn)          AHB_DLSYM("AHardwareBuffer_describe");
+    ahb_lock_sym               = (ahb_lock_fn)              AHB_DLSYM("AHardwareBuffer_lock");
+    ahb_unlock_sym             = (ahb_unlock_fn)            AHB_DLSYM("AHardwareBuffer_unlock");
+    ahb_acquire_sym            = (ahb_acquire_fn)           AHB_DLSYM("AHardwareBuffer_acquire");
+    ahb_release_sym            = (ahb_release_fn)           AHB_DLSYM("AHardwareBuffer_release");
+    ahb_get_native_handle_sym  = (ahb_get_native_handle_fn) AHB_DLSYM("AHardwareBuffer_getNativeHandle");
+    ahb_create_from_handle_sym = (ahb_create_from_handle_fn)AHB_DLSYM("AHardwareBuffer_createFromHandle");
+#undef AHB_DLSYM
+
+    if (!ahb_allocate_sym || !ahb_describe_sym || !ahb_lock_sym ||
+        !ahb_unlock_sym   || !ahb_acquire_sym  || !ahb_release_sym ||
+        !ahb_get_native_handle_sym || !ahb_create_from_handle_sym) {
+        ahb_libnativewindow = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+
 // simple macros to make sure the code is only compiled if we actually have the
 // header to be able to compile it.
 // we could also use Gralloc1On0Adapter, but that would mean we need to import
@@ -102,6 +250,9 @@ static void gralloc1_init(void);
 #define GRALLOC_COMPAT(code) (0) {}
 #endif
 
+// AHardwareBuffer-based backend, preferred when libnativewindow.so loads.
+#define GRALLOC_AHB(code) (version == 3) { code }
+
 #define NO_GRALLOC { fprintf(stderr, "%s:%d: called gralloc method without gralloc loaded\n", __func__, __LINE__); assert(NULL); }
 
 void hybris_gralloc_deinitialize(void);
@@ -109,9 +260,17 @@ void hybris_gralloc_deinitialize(void);
 void hybris_gralloc_initialize(int framebuffer)
 {
     if (version == -1) {
+        // Prefer the AHB backend: it talks to whatever gralloc the system
+        // currently ships (gralloc4 on modern Android) via the public NDK
+        // API, so handles are always in a format the Android-side mapper
+        // understands. The framebuffer path still needs GRALLOC0 because AHB
+        // doesn't expose framebuffer_device_t operations.
+        if (!framebuffer && ahb_init()) {
+            version = 3;
+            atexit(hybris_gralloc_deinitialize);
+        } else
 #if ANDROID_VERSION_MAJOR>=10
-        hybris_ui_initialize();
-        if (hybris_ui_check_for_symbol("graphic_buffer_allocator_allocate")) {
+        if (hybris_ui_initialize(), hybris_ui_check_for_symbol("graphic_buffer_allocator_allocate")) {
             version = 2;
         } else
 #endif
@@ -168,6 +327,9 @@ void hybris_gralloc_initialize(int framebuffer)
 
 void hybris_gralloc_deinitialize(void)
 {
+    // AHB backend has no device/module to close — releases happen per-buffer.
+    // The libnativewindow handle is process-global; leave it loaded.
+
     if (framebuffer_device) framebuffer_close(framebuffer_device);
     framebuffer_device = NULL;
 
@@ -241,7 +403,19 @@ int hybris_gralloc_release(buffer_handle_t handle, int was_allocated)
 {
     int ret = -ENOSYS;
 
-    if GRALLOC_COMPAT(
+    if GRALLOC_AHB(
+        AHardwareBuffer *ahb = NULL;
+        int rc = ahb_map_decref_take(handle, &ahb);
+        if (rc == 0) {
+            ahb_release_sym(ahb);
+            ret = 0;
+        } else if (rc == 1) {
+            ret = 0;
+        } else {
+            fprintf(stderr, "hybris_gralloc_release: handle %p not in AHB map\n", handle);
+            ret = -EINVAL;
+        }
+    ) else if GRALLOC_COMPAT(
         if (was_allocated) {
             ret = graphic_buffer_allocator_free(handle);
         } else {
@@ -276,7 +450,16 @@ int hybris_gralloc_import_buffer(buffer_handle_t raw_handle, buffer_handle_t* ou
 {
     int ret = -ENOSYS;
 
-    if GRALLOC_COMPAT(
+    if GRALLOC_AHB(
+        // AHardwareBuffer_createFromHandle requires a fully-populated desc,
+        // which this entry point doesn't carry. Callers that route through
+        // the AHB backend need to use hybris_gralloc_allocate or the
+        // matching server_wlegl path that knows the dimensions. Return
+        // -ENOSYS so callers can detect the limitation.
+        (void)raw_handle;
+        (void)out_handle;
+        ret = -ENOSYS;
+    ) else if GRALLOC_COMPAT(
         ret = graphic_buffer_mapper_import_buffer_no_size(raw_handle, out_handle);
     ) else {
         // clone input buffer first when using gralloc 1 or 0
@@ -297,7 +480,16 @@ int hybris_gralloc_retain(buffer_handle_t handle)
 {
     int ret = -ENOSYS;
 
-    if GRALLOC1(
+    if GRALLOC_AHB(
+        AHardwareBuffer *ahb = ahb_map_find(handle);
+        if (ahb) {
+            ahb_acquire_sym(ahb);
+            ahb_map_incref(handle);
+            ret = 0;
+        } else {
+            ret = -EINVAL;
+        }
+    ) else if GRALLOC1(
         ret = gralloc1_retain(gralloc1_device, handle);
     ) else if GRALLOC0(
         ret = gralloc0_module->registerBuffer(gralloc0_module, handle);
@@ -310,7 +502,41 @@ int hybris_gralloc_allocate(int width, int height, int format, int usage, buffer
 {
     int ret = -ENOSYS;
 
-    if GRALLOC_COMPAT(
+    if GRALLOC_AHB(
+        // AHB format constants match HAL_PIXEL_FORMAT_* for the common cases
+        // (RGBA_8888, RGB_888, RGB_565, RGBA_FP16, RGBA_1010102). AHB usage
+        // flags share the low bits with gralloc1 producer/consumer usage —
+        // GPU_SAMPLED_IMAGE / GPU_COLOR_OUTPUT / COMPOSER_OVERLAY / CPU_*
+        // align exactly, which covers everything libhybris callers ask for.
+        AHardwareBuffer_Desc desc;
+        desc.width  = (uint32_t)width;
+        desc.height = (uint32_t)height;
+        desc.layers = 1;
+        desc.format = (uint32_t)format;
+        desc.usage  = (uint64_t)(uint32_t)usage;
+        desc.stride = 0;
+        desc.rfu0   = 0;
+        desc.rfu1   = 0;
+
+        AHardwareBuffer *ahb = NULL;
+        int rc = ahb_allocate_sym(&desc, &ahb);
+        if (rc != 0 || !ahb) {
+            ret = rc ? rc : -ENOMEM;
+        } else {
+            AHardwareBuffer_Desc actual;
+            ahb_describe_sym(ahb, &actual);
+            const native_handle_t *h = ahb_get_native_handle_sym(ahb);
+            if (!h) {
+                ahb_release_sym(ahb);
+                ret = -EINVAL;
+            } else {
+                *handle_ptr = h;
+                if (stride_ptr) *stride_ptr = actual.stride;
+                ahb_map_insert(h, ahb);
+                ret = 0;
+            }
+        }
+    ) else if GRALLOC_COMPAT(
         ret = graphic_buffer_allocator_allocate(width, height, format, 1 /*layerCount*/, usage,
                                                 handle_ptr, stride_ptr, 0 /*graphicBufferId*/, "hybris-gralloc");
     ) else if GRALLOC1(
@@ -346,7 +572,22 @@ int hybris_gralloc_lock(buffer_handle_t handle, int usage, int l, int t, int w, 
 {
     int ret = -ENOSYS;
 
-    if GRALLOC_COMPAT(
+    if GRALLOC_AHB(
+        AHardwareBuffer *ahb = ahb_map_find(handle);
+        if (!ahb) {
+            ret = -EINVAL;
+        } else {
+            ARect rect;
+            rect.left   = l;
+            rect.top    = t;
+            rect.right  = l + w;
+            rect.bottom = t + h;
+            // Pass the full buffer when rect matches (left=0,top=0,w=0,h=0).
+            const ARect *region = (l == 0 && t == 0 && w == 0 && h == 0)
+                                      ? NULL : &rect;
+            ret = ahb_lock_sym(ahb, (uint64_t)(uint32_t)usage, -1, region, vaddr);
+        }
+    ) else if GRALLOC_COMPAT(
         ARect bounds;
         int32_t outBytesPerPixel;
         int32_t outBytesPerStride;
@@ -382,7 +623,16 @@ int hybris_gralloc_unlock(buffer_handle_t handle)
 {
     int ret = -ENOSYS;
 
-    if GRALLOC_COMPAT(
+    if GRALLOC_AHB(
+        AHardwareBuffer *ahb = ahb_map_find(handle);
+        if (!ahb) {
+            ret = -EINVAL;
+        } else {
+            int32_t fence = -1;
+            ret = ahb_unlock_sym(ahb, &fence);
+            if (fence >= 0) close(fence);
+        }
+    ) else if GRALLOC_COMPAT(
         ret = graphic_buffer_mapper_unlock(handle);
     ) else if GRALLOC1(
         int releaseFence = 0;
