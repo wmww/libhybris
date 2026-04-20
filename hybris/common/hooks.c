@@ -3766,8 +3766,7 @@ static void __hybris_linker_init()
     if (getenv("HYBRIS_PATCH_TLS") != NULL) {
         tls_patcher_funcs.patch_tls = hybris_patch_tls;
         tls_patcher_funcs.register_thunk_region = hybris_register_thunk_region;
-        tls_patcher_funcs.allocate_thunk_near = hybris_allocate_thunk_near;
-        tls_patcher_funcs.is_within_thunk_region = hybris_is_within_thunk_region;
+        tls_patcher_funcs.count_tls = hybris_count_tls;
     }
 #endif
 
