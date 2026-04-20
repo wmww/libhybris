@@ -349,8 +349,13 @@ int BaseNativeWindow::_query(const struct ANativeWindow* window, int what, int* 
 			*value = 1;
 			return NO_ERROR;
 		case NATIVE_WINDOW_BUFFER_AGE:
-			// sure :)
-			*value = 2;
+			// 0 means "content is undefined"; clients must redraw the
+			// whole surface. Returning the hardcoded 2 we had before
+			// caused Firefox/WebRender partial-present to layer damage
+			// on top of stale pool-slot content, producing a visible
+			// A-B-A flicker when the client cycled slots faster than
+			// the contents actually changed.
+			*value = 0;
 			return NO_ERROR;
 #endif
 #if ANDROID_VERSION_MAJOR>=9
