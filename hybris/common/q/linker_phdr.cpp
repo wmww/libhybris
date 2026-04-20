@@ -51,8 +51,7 @@
 
 #include "../tls_patcher.h"
 
-// Thunk allocation constants
-#define THUNK_PADDING_SIZE (64 * 1024)  // 64KB padding after each executable segment
+extern hybris_tls_patcher_funcs_t _tls_patcher_funcs;
 
 static int GetTargetElfMachine() {
 #if defined(__arm__)
@@ -576,17 +575,22 @@ bool ElfReader::ReserveAddressSpace(address_space_params* address_space) {
     return false;
   }
 
-  // Add space for thunk regions after all segments
-  size_t num_executable_segments = 0;
-  for (size_t i = 0; i < phdr_num_; ++i) {
-    const ElfW(Phdr)* phdr = &phdr_table_[i];
-    if (phdr->p_type == PT_LOAD && (phdr->p_flags & PF_X) != 0) {
-      num_executable_segments++;
+  // Over-reserve VA space for the TLS thunk region that will be placed after
+  // the ELF segments. The actual thunk size is determined exactly by counting
+  // MRS instructions in LoadSegments; this just ensures there's room.
+  // Worst case: every instruction is MRS → (code_size / 4) * 16 = 4x code
+  // size. Page-aligned since the thunk mmap rounds up to page boundaries.
+  // This only costs virtual address space (PROT_NONE), not physical memory.
+  if (_tls_patcher_funcs.patch_tls) {
+    size_t thunk_reserve = 0;
+    for (size_t i = 0; i < phdr_num_; ++i) {
+      const ElfW(Phdr)* phdr = &phdr_table_[i];
+      if (phdr->p_type == PT_LOAD && (phdr->p_flags & PF_X) != 0) {
+        thunk_reserve += phdr->p_filesz * 4;
+      }
     }
+    load_size_ += PAGE_END(thunk_reserve);
   }
-
-  size_t total_thunk_size = num_executable_segments * THUNK_PADDING_SIZE;
-  load_size_ += total_thunk_size;
 
   uint8_t* addr = reinterpret_cast<uint8_t*>(min_vaddr);
   void* start;
@@ -615,8 +619,6 @@ bool ElfReader::ReserveAddressSpace(address_space_params* address_space) {
   load_bias_ = reinterpret_cast<uint8_t*>(start) - addr;
   return true;
 }
-
-extern hybris_tls_patcher_funcs_t _tls_patcher_funcs;
 
 bool ElfReader::LoadSegments() {
   // Collect executable segments for TLS patching after thunk regions are registered
@@ -737,74 +739,77 @@ bool ElfReader::LoadSegments() {
     }
   }
 
-  // Calculate where thunk regions should start - after all ELF segments
-  // Use the original load size calculation to find the end of ELF segments
-  ElfW(Addr) min_vaddr, max_vaddr;
-  size_t elf_size = phdr_table_get_load_size(phdr_table_, phdr_num_, &min_vaddr, &max_vaddr);
-  ElfW(Addr) thunk_start = reinterpret_cast<ElfW(Addr)>(load_start_) + elf_size;
-
-  // Now map thunk regions after all segments for each executable segment
-  for (size_t i = 0; i < phdr_num_; ++i) {
-    const ElfW(Phdr)* phdr = &phdr_table_[i];
-
-    if (phdr->p_type != PT_LOAD || (phdr->p_flags & PF_X) == 0) {
-      continue;
+  // hybris: Two-pass TLS patching.
+  // Pass 1: count MRS TPIDR_EL0 instructions to size the thunk region exactly.
+  // Pass 2: allocate thunks and patch instructions.
+  if (_tls_patcher_funcs.count_tls && _tls_patcher_funcs.patch_tls && !exec_segments.empty()) {
+    // Pass 1: count
+    size_t total_mrs_count = 0;
+    for (const auto& seg : exec_segments) {
+      total_mrs_count += _tls_patcher_funcs.count_tls(seg.addr, seg.size);
     }
 
-    // Ensure we don't map beyond our reserved address space
-    ElfW(Addr) load_end = reinterpret_cast<ElfW(Addr)>(load_start_) + load_size_;
-    if (thunk_start + THUNK_PADDING_SIZE > load_end) {
-      DL_ERR("thunk region for \"%s\" segment %zd would exceed reserved address space",
-             name_.c_str(), i);
-      return false;
+    void* thunk_region = nullptr;
+    size_t thunk_size = 0;
+
+    if (total_mrs_count > 0) {
+      // Allocate one thunk region sized exactly for all MRS instructions,
+      // placed right after the ELF segments in the over-reserved address space.
+      thunk_size = total_mrs_count * 16;  // 16 bytes per thunk
+      thunk_size = (thunk_size + 4095) & ~(size_t)4095;  // page-align
+
+      ElfW(Addr) min_vaddr, max_vaddr;
+      size_t elf_size = phdr_table_get_load_size(phdr_table_, phdr_num_, &min_vaddr, &max_vaddr);
+      ElfW(Addr) thunk_addr = reinterpret_cast<ElfW(Addr)>(load_start_) + elf_size;
+      ElfW(Addr) load_end = reinterpret_cast<ElfW(Addr)>(load_start_) + load_size_;
+
+      if (thunk_addr + thunk_size > load_end) {
+        // This means the over-reservation estimate was too small. Increase
+        // the multiplier in estimate_thunk_space() to fix.
+        DL_ERR("thunk region for \"%s\" (%zu thunks, %zu bytes) exceeds reserved space "
+               "(%zu bytes available)", name_.c_str(), total_mrs_count, thunk_size,
+               (size_t)(load_end - thunk_addr));
+        return false;
+      }
+
+      thunk_region = mmap(reinterpret_cast<void*>(thunk_addr), thunk_size,
+                               PROT_READ | PROT_WRITE | PROT_EXEC,
+                               MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE,
+                               -1, 0);
+      if (thunk_region == MAP_FAILED) {
+        DL_ERR("couldn't map thunk region for \"%s\": %s", name_.c_str(), strerror(errno));
+        return false;
+      }
+
+      prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, thunk_region, thunk_size, ".thunks");
+
+      if (_tls_patcher_funcs.register_thunk_region) {
+        _tls_patcher_funcs.register_thunk_region(thunk_region, thunk_size);
+      }
+
+      LD_LOG(kLogDlopen, "Mapped thunk region for %s: %p (%zu bytes, %zu thunks)",
+             name_.c_str(), thunk_region, thunk_size, total_mrs_count);
     }
 
-    void* thunk_region = mmap(reinterpret_cast<void*>(thunk_start),
-                             THUNK_PADDING_SIZE,
-                             PROT_READ | PROT_WRITE | PROT_EXEC,
-                             MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE,
-                             -1,
-                             0);
-    if (thunk_region == MAP_FAILED) {
-      DL_ERR("couldn't map thunk region for \"%s\" segment %zd: %s",
-             name_.c_str(), i, strerror(errno));
-      return false;
-    }
-
-    // Verify we got the address we expected
-    if (thunk_region != reinterpret_cast<void*>(thunk_start)) {
-      DL_ERR("thunk region for \"%s\" segment %zd mapped at wrong address: expected %p, got %p",
-             name_.c_str(), i, reinterpret_cast<void*>(thunk_start), thunk_region);
-      return false;
-    }
-
-    prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, thunk_region, THUNK_PADDING_SIZE, ".thunks");
-
-    // Register the thunk region with the TLS patcher
-    if (_tls_patcher_funcs.register_thunk_region) {
-      _tls_patcher_funcs.register_thunk_region(thunk_region, THUNK_PADDING_SIZE);
-    }
-
-    LD_LOG(kLogDlopen, "Mapped thunk region for %s: %p - %p (%zu bytes)",
-           name_.c_str(), thunk_region,
-           reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(thunk_region) + THUNK_PADDING_SIZE),
-           THUNK_PADDING_SIZE);
-
-    // Move to next thunk region
-    thunk_start += THUNK_PADDING_SIZE;
-  }
-
-  // hybris: Now that all thunk regions are registered, patch TLS accesses in executable segments
-  if (_tls_patcher_funcs.patch_tls && !exec_segments.empty()) {
+    // Pass 2: patch
     for (const auto& seg : exec_segments) {
       _tls_patcher_funcs.patch_tls(seg.addr, seg.size, name_.c_str());
 
-      // Restore original write protection if needed
+      // Restore original protection (remove PROT_WRITE we added for patching,
+      // keep PROT_READ that hybris adds for unwind safety)
       if ((seg.orig_prot & PROT_WRITE) == 0) {
-        int prot = PFLAGS_TO_PROT(seg.orig_prot) | PROT_READ;
-        if (mprotect(seg.addr, seg.size, prot) < 0) {
-          DL_ERR("couldn't mprotect \"%s\" segment: %s", name_.c_str(), strerror(errno));
+        if (mprotect(seg.addr, seg.size, seg.orig_prot | PROT_READ) < 0) {
+          DL_ERR("couldn't restore protection on \"%s\" segment: %s", name_.c_str(), strerror(errno));
+          return false;
         }
+      }
+    }
+
+    // Remove write permission from thunk region now that patching is done
+    if (thunk_region != nullptr) {
+      if (mprotect(thunk_region, thunk_size, PROT_READ | PROT_EXEC) < 0) {
+        DL_ERR("couldn't make thunk region read-only for \"%s\": %s", name_.c_str(), strerror(errno));
+        return false;
       }
     }
   }
