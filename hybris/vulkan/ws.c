@@ -88,6 +88,20 @@ void ws_vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkA
     _init_ws();
     ws->vkDestroySurfaceKHR(instance, surface, pAllocator);
 }
+
+void ws_patchSurfaceCapabilities(VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* pSurfaceCapabilities)
+{
+    _init_ws();
+    if (ws->patchSurfaceCapabilities)
+        ws->patchSurfaceCapabilities(surface, pSurfaceCapabilities);
+}
+
+void ws_prepareSwapchain(const VkSwapchainCreateInfoKHR* pCreateInfo)
+{
+    _init_ws();
+    if (ws->prepareSwapchain)
+        ws->prepareSwapchain(pCreateInfo);
+}
 #endif
 
 void ws_vkSetInstanceProcAddrFunc(PFN_vkVoidFunction addr)

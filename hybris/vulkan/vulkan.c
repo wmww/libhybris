@@ -146,6 +146,26 @@ void vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkAllo
 {
     ws_vkDestroySurfaceKHR(instance, surface, pAllocator);
 }
+
+VkResult vkCreateXlibSurfaceKHR(VkInstance instance, const void* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSurfaceKHR* pSurface)
+{
+    return VK_ERROR_EXTENSION_NOT_PRESENT;
+}
+
+VkBool32 vkGetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, void* dpy, unsigned long visualID)
+{
+    return VK_FALSE;
+}
+
+VkResult vkCreateXcbSurfaceKHR(VkInstance instance, const void* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSurfaceKHR* pSurface)
+{
+    return VK_ERROR_EXTENSION_NOT_PRESENT;
+}
+
+VkBool32 vkGetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, void* connection, uint32_t visual_id)
+{
+    return VK_FALSE;
+}
 #else
 VULKAN_IDLOAD(vkDestroySurfaceKHR);
 #endif
@@ -169,13 +189,40 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
         return (PFN_vkVoidFunction)vkGetPhysicalDeviceWaylandPresentationSupportKHR;
     } else if (!strcmp(pName, "vkDestroySurfaceKHR")) {
         return (PFN_vkVoidFunction)vkDestroySurfaceKHR;
+    } else if (!strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) {
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceSurfaceCapabilitiesKHR;
+    } else if (!strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilities2KHR")) {
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceSurfaceCapabilities2KHR;
+    } else if (!strcmp(pName, "vkCreateSwapchainKHR")) {
+        return (PFN_vkVoidFunction)vkCreateSwapchainKHR;
+    } else if (!strcmp(pName, "vkGetDeviceProcAddr")) {
+        return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
 #endif
     }
 
     return (*_vkGetInstanceProcAddr)(instance, pName);
 }
 
+#ifdef WANT_WAYLAND
+static PFN_vkVoidFunction (*_real_vkGetDeviceProcAddr)(VkDevice device, const char* pName) = NULL;
+
+PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice device, const char* pName)
+{
+    if (!_real_vkGetDeviceProcAddr) {
+        if (!vulkan_handle) _init_androidvulkan();
+        _real_vkGetDeviceProcAddr = (PFN_vkVoidFunction (*)(VkDevice, const char*))
+            android_dlsym(vulkan_handle, "vkGetDeviceProcAddr");
+    }
+
+    if (!strcmp(pName, "vkCreateSwapchainKHR")) {
+        return (PFN_vkVoidFunction)vkCreateSwapchainKHR;
+    }
+
+    return _real_vkGetDeviceProcAddr(device, pName);
+}
+#else
 VULKAN_IDLOAD(vkGetDeviceProcAddr);
+#endif
 VULKAN_IDLOAD(vkCreateDevice);
 VULKAN_IDLOAD(vkDestroyDevice);
 VULKAN_IDLOAD(vkEnumerateDeviceExtensionProperties);
@@ -382,10 +429,42 @@ VULKAN_IDLOAD(vkGetDeviceImageMemoryRequirements);
 VULKAN_IDLOAD(vkGetDeviceImageSparseMemoryRequirements);
 #endif
 VULKAN_IDLOAD(vkGetPhysicalDeviceSurfaceSupportKHR);
-VULKAN_IDLOAD(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
 VULKAN_IDLOAD(vkGetPhysicalDeviceSurfaceFormatsKHR);
 VULKAN_IDLOAD(vkGetPhysicalDeviceSurfacePresentModesKHR);
+
+#ifdef WANT_WAYLAND
+static VkResult (*_real_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)(VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR*) = NULL;
+
+VkResult vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physicalDevice, VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* pSurfaceCapabilities)
+{
+    if (!_real_vkGetPhysicalDeviceSurfaceCapabilitiesKHR) {
+        if (!vulkan_handle) _init_androidvulkan();
+        _real_vkGetPhysicalDeviceSurfaceCapabilitiesKHR = (VkResult (*)(VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR*))
+            android_dlsym(vulkan_handle, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    }
+    VkResult result = _real_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, pSurfaceCapabilities);
+    if (result == VK_SUCCESS) {
+        ws_patchSurfaceCapabilities(surface, pSurfaceCapabilities);
+    }
+    return result;
+}
+
+static VkResult (*_real_vkCreateSwapchainKHR)(VkDevice, const VkSwapchainCreateInfoKHR*, const VkAllocationCallbacks*, VkSwapchainKHR*) = NULL;
+
+VkResult vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain)
+{
+    ws_prepareSwapchain(pCreateInfo);
+    if (!_real_vkCreateSwapchainKHR) {
+        if (!vulkan_handle) _init_androidvulkan();
+        _real_vkCreateSwapchainKHR = (VkResult (*)(VkDevice, const VkSwapchainCreateInfoKHR*, const VkAllocationCallbacks*, VkSwapchainKHR*))
+            android_dlsym(vulkan_handle, "vkCreateSwapchainKHR");
+    }
+    return _real_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+}
+#else
+VULKAN_IDLOAD(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
 VULKAN_IDLOAD(vkCreateSwapchainKHR);
+#endif
 VULKAN_IDLOAD(vkDestroySwapchainKHR);
 VULKAN_IDLOAD(vkGetSwapchainImagesKHR);
 VULKAN_IDLOAD(vkAcquireNextImageKHR);
@@ -456,7 +535,34 @@ VULKAN_IDLOAD(vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR);
 VULKAN_IDLOAD(vkGetPhysicalDeviceQueueFamilyPerformanceQueryPassesKHR);
 VULKAN_IDLOAD(vkAcquireProfilingLockKHR);
 VULKAN_IDLOAD(vkReleaseProfilingLockKHR);
+#ifdef WANT_WAYLAND
+static VkResult (*_real_vkGetPhysicalDeviceSurfaceCapabilities2KHR)(VkPhysicalDevice, const VkPhysicalDeviceSurfaceInfo2KHR*, VkSurfaceCapabilities2KHR*) = NULL;
+
+VkResult vkGetPhysicalDeviceSurfaceCapabilities2KHR(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceSurfaceInfo2KHR* pSurfaceInfo, VkSurfaceCapabilities2KHR* pSurfaceCapabilities)
+{
+    if (!_real_vkGetPhysicalDeviceSurfaceCapabilities2KHR) {
+        if (!vulkan_handle) _init_androidvulkan();
+        _real_vkGetPhysicalDeviceSurfaceCapabilities2KHR = (VkResult (*)(VkPhysicalDevice, const VkPhysicalDeviceSurfaceInfo2KHR*, VkSurfaceCapabilities2KHR*))
+            android_dlsym(vulkan_handle, "vkGetPhysicalDeviceSurfaceCapabilities2KHR");
+        if (!_real_vkGetPhysicalDeviceSurfaceCapabilities2KHR && _vkGetInstanceProcAddr) {
+            _real_vkGetPhysicalDeviceSurfaceCapabilities2KHR = (VkResult (*)(VkPhysicalDevice, const VkPhysicalDeviceSurfaceInfo2KHR*, VkSurfaceCapabilities2KHR*))
+                (*_vkGetInstanceProcAddr)(NULL, "vkGetPhysicalDeviceSurfaceCapabilities2KHR");
+        }
+    }
+    if (!_real_vkGetPhysicalDeviceSurfaceCapabilities2KHR) {
+        // Fall back to the non-2 variant
+        VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, pSurfaceInfo->surface, &pSurfaceCapabilities->surfaceCapabilities);
+        return result;
+    }
+    VkResult result = _real_vkGetPhysicalDeviceSurfaceCapabilities2KHR(physicalDevice, pSurfaceInfo, pSurfaceCapabilities);
+    if (result == VK_SUCCESS) {
+        ws_patchSurfaceCapabilities(pSurfaceInfo->surface, &pSurfaceCapabilities->surfaceCapabilities);
+    }
+    return result;
+}
+#else
 VULKAN_IDLOAD(vkGetPhysicalDeviceSurfaceCapabilities2KHR);
+#endif
 VULKAN_IDLOAD(vkGetPhysicalDeviceSurfaceFormats2KHR);
 VULKAN_IDLOAD(vkGetPhysicalDeviceDisplayProperties2KHR);
 VULKAN_IDLOAD(vkGetPhysicalDeviceDisplayPlaneProperties2KHR);
