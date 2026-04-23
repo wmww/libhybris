@@ -83,6 +83,8 @@ struct ws_module ws_module_info = {
     nullws_vkCreateWaylandSurfaceKHR,
     nullws_vkGetPhysicalDeviceWaylandPresentationSupportKHR,
     nullws_vkDestroySurfaceKHR,
+    NULL,
+    NULL,
 #endif
     nullws_vkSetInstanceProcAddrFunc,
 };
