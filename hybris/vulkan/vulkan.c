@@ -35,19 +35,43 @@
 static void *vulkan_handle = NULL;
 
 /*
- * This generates a function that when first called overwrites it's plt entry with new address.
- * Subsequent calls jump directly at the target function in the android library.
- * This means effectively 0 call overhead after the first call.
+ * Arm64 assembly trampoline replacing the original IFUNC-based VULKAN_IDLOAD.
+ *
+ * The original used gnu_indirect_function, whose resolver runs during the
+ * dynamic linker's relocation phase. That resolver called android_dlopen()
+ * to load the Android Vulkan driver, which crashes when triggered alongside
+ * complex library trees (e.g. GTK4 links libvulkan.so.1 at build time).
+ *
+ * Each VULKAN_IDLOAD now emits:
+ *   1. A hidden function-pointer variable (_vulkan_ptr_<sym>)
+ *   2. A linker-set entry registering it for bulk resolution
+ *   3. A 3-instruction trampoline: adrp+ldr+br through x16 (the
+ *      intra-procedure-call scratch register), preserving all args
+ *
+ * A constructor resolves all pointers after relocation completes.
  */
 
+struct _vulkan_sym_entry {
+    void **ptr;
+    const char *name;
+};
+
 #define VULKAN_IDLOAD(sym) \
- __asm__ (".type " #sym ", %gnu_indirect_function"); \
-typeof(sym) * sym ## _dispatch (void) __asm__ (#sym);\
-typeof(sym) * sym ## _dispatch (void) \
-{ \
-    if (!vulkan_handle) _init_androidvulkan(); \
-    return (void *) android_dlsym(vulkan_handle, #sym); \
-}
+__attribute__((visibility("hidden"))) void *_vulkan_ptr_##sym = NULL; \
+static const struct _vulkan_sym_entry _vulkan_reg_##sym \
+    __attribute__((used, section("vulkan_syms"))) = \
+    { &_vulkan_ptr_##sym, #sym }; \
+__asm__( \
+    ".text\n" \
+    ".globl " #sym "\n" \
+    ".type " #sym ", %function\n" \
+    ".balign 16\n" \
+    #sym ":\n" \
+    "    adrp x16, _vulkan_ptr_" #sym "\n" \
+    "    ldr x16, [x16, :lo12:_vulkan_ptr_" #sym "]\n" \
+    "    br x16\n" \
+    ".size " #sym ", .-" #sym "\n" \
+);
 
 static void _init_androidvulkan()
 {
@@ -671,7 +695,7 @@ VULKAN_IDLOAD(vkCreatePrivateDataSlotEXT);
 VULKAN_IDLOAD(vkDestroyPrivateDataSlotEXT);
 VULKAN_IDLOAD(vkSetPrivateDataEXT);
 VULKAN_IDLOAD(vkGetPrivateDataEXT);
-#if VK_HEADER_VERSION >= 269
+#ifdef VK_NV_cuda_kernel_launch
 VULKAN_IDLOAD(vkCreateCudaModuleNV);
 VULKAN_IDLOAD(vkGetCudaModuleCacheNV);
 VULKAN_IDLOAD(vkCreateCudaFunctionNV);
@@ -856,5 +880,18 @@ VULKAN_IDLOAD(vkCmdDrawMeshTasksEXT);
 VULKAN_IDLOAD(vkCmdDrawMeshTasksIndirectEXT);
 VULKAN_IDLOAD(vkCmdDrawMeshTasksIndirectCountEXT);
 #endif
+
+extern const struct _vulkan_sym_entry __start_vulkan_syms[];
+extern const struct _vulkan_sym_entry __stop_vulkan_syms[];
+
+__attribute__((constructor))
+static void _resolve_vulkan_syms(void)
+{
+    _init_androidvulkan();
+    for (const struct _vulkan_sym_entry *s = __start_vulkan_syms;
+         s < __stop_vulkan_syms; s++) {
+        *s->ptr = android_dlsym(vulkan_handle, s->name);
+    }
+}
 
 // vim:ts=4:sw=4:noexpandtab
