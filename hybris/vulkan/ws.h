@@ -40,6 +40,8 @@ struct ws_module {
     VkResult (*vkCreateWaylandSurfaceKHR)(VkInstance instance, const VkWaylandSurfaceCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSurfaceKHR* pSurface);
     VkBool32 (*vkGetPhysicalDeviceWaylandPresentationSupportKHR)(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, struct wl_display* display);
     void (*vkDestroySurfaceKHR)(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks* pAllocator);
+    void (*patchSurfaceCapabilities)(VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* pSurfaceCapabilities);
+    void (*prepareSwapchain)(const VkSwapchainCreateInfoKHR* pCreateInfo);
 #endif
     void (*vkSetInstanceProcAddrFunc)(PFN_vkVoidFunction addr);
 };
@@ -50,6 +52,8 @@ VkResult ws_vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAl
 VkResult ws_vkCreateWaylandSurfaceKHR(VkInstance instance, const VkWaylandSurfaceCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSurfaceKHR* pSurface);
 VkBool32 ws_vkGetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, struct wl_display* display);
 void ws_vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks* pAllocator);
+void ws_patchSurfaceCapabilities(VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* pSurfaceCapabilities);
+void ws_prepareSwapchain(const VkSwapchainCreateInfoKHR* pCreateInfo);
 #endif
 void ws_vkSetInstanceProcAddrFunc(PFN_vkVoidFunction addr);
 #endif
