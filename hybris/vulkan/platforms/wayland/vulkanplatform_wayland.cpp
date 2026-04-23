@@ -84,6 +84,15 @@ struct WaylandDisplay *vulkan_wayland_pop_mapping(VkSurfaceKHR surface)
     return result;
 }
 
+struct WaylandDisplay *vulkan_wayland_get_mapping(VkSurfaceKHR surface)
+{
+    std::map<VkSurfaceKHR, struct WaylandDisplay *>::iterator it;
+    it = _surface_window_map.find(surface);
+    if (it == _surface_window_map.end())
+        return NULL;
+    return it->second;
+}
+
 static VkResult (*_vkCreateAndroidSurfaceKHR)(VkInstance instance, const VkAndroidSurfaceCreateInfoKHR *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface) = NULL;
 static PFN_vkVoidFunction (*_vkDestroySurfaceKHR)(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks* pAllocator) = NULL;
 static VkResult (*_vkEnumerateInstanceExtensionProperties)(const char *pLayerName, uint32_t *pPropertyCount, VkExtensionProperties *pProperties) = NULL;
@@ -293,6 +302,33 @@ extern "C" void waylandws_vkSetInstanceProcAddrFunc(PFN_vkVoidFunction addr)
         _vkGetInstanceProcAddr = (PFN_vkVoidFunction (*)(VkInstance, const char*))addr;
 }
 
+static void waylandws_patchSurfaceCapabilities(VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* pSurfaceCapabilities)
+{
+    // Vulkan spec for Wayland: currentExtent should be undefined (0xFFFFFFFF),
+    // letting the app choose its own size via vkCreateSwapchainKHR.
+    // prepareSwapchain will resize the WaylandNativeWindow to match.
+    pSurfaceCapabilities->currentExtent.width = 0xFFFFFFFF;
+    pSurfaceCapabilities->currentExtent.height = 0xFFFFFFFF;
+
+    if (pSurfaceCapabilities->maxImageExtent.width < 16384)
+        pSurfaceCapabilities->maxImageExtent.width = 16384;
+    if (pSurfaceCapabilities->maxImageExtent.height < 16384)
+        pSurfaceCapabilities->maxImageExtent.height = 16384;
+}
+
+static void waylandws_prepareSwapchain(const VkSwapchainCreateInfoKHR* pCreateInfo)
+{
+    struct WaylandDisplay *wdpy = vulkan_wayland_get_mapping(pCreateInfo->surface);
+    if (!wdpy)
+        return;
+
+    unsigned int width = pCreateInfo->imageExtent.width;
+    unsigned int height = pCreateInfo->imageExtent.height;
+    if (width > 0 && height > 0) {
+        wdpy->window->resize(width, height);
+    }
+}
+
 struct ws_module ws_module_info = {
     waylandws_init_module,
 
@@ -301,5 +337,7 @@ struct ws_module ws_module_info = {
     waylandws_vkCreateWaylandSurfaceKHR,
     waylandws_vkGetPhysicalDeviceWaylandPresentationSupportKHR,
     waylandws_vkDestroySurfaceKHR,
+    waylandws_patchSurfaceCapabilities,
+    waylandws_prepareSwapchain,
     waylandws_vkSetInstanceProcAddrFunc,
 };
