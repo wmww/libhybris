@@ -250,8 +250,6 @@ int WaylandNativeWindow::queueBuffer(BaseNativeWindowBuffer* buffer, int fenceFd
 
     }
 
-    presentBuffer(wnb);
-
 #if ANDROID_VERSION_MAJOR>=4 && ANDROID_VERSION_MINOR>=2 || ANDROID_VERSION_MAJOR>=5
     HYBRIS_TRACE_BEGIN("wayland-platform", "queueBuffer_waiting_for_fence", "-%p", wnb);
     if (fenceFd >= 0)
@@ -261,6 +259,13 @@ int WaylandNativeWindow::queueBuffer(BaseNativeWindowBuffer* buffer, int fenceFd
     }
     HYBRIS_TRACE_END("wayland-platform", "queueBuffer_waiting_for_fence", "-%p", wnb);
 #endif
+
+    // Fence wait must precede attach+commit. The Wayland compositor sees the
+    // buffer the instant we commit; it has no linux_drm_syncobj or equivalent
+    // to wait on per-commit fences. If we committed while the GPU was still
+    // writing, the compositor would composite whatever partial/empty content
+    // was in the buffer at that moment.
+    presentBuffer(wnb);
 
     HYBRIS_TRACE_COUNTER("wayland-platform", "fronted.size", "%lu", fronted.size());
     HYBRIS_TRACE_END("wayland-platform", "queueBuffer", "-%p", wnb);
