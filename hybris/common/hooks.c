@@ -3031,6 +3031,29 @@ int _hybris_hook_android_fdsan_close_with_tag(int fd, uint64_t tag)
     return close(fd);
 }
 
+/* Bionic libdl.so's __cfi_slowpath{,_diag} validate indirect calls against a
+ * sparse shadow table that the bionic linker builds at process start, covering
+ * only system libraries. Vendor libraries we android_dlopen here are absent
+ * from that shadow, so the real __cfi_slowpath would fault on their indirect
+ * calls. Hooking the symbol redirects each loaded vendor library's GOT entry
+ * for __cfi_slowpath{,_diag} at relocation time (linker.cpp:_get_hooked_symbol)
+ * to these no-op stubs, matching kUncheckedShadow semantics — vendor libraries
+ * lack __cfi_check anyway, so a properly initialised shadow would pass them
+ * through unchecked. Avoids ever needing to mprotect bionic libdl.so, which
+ * fails on stock Android's runas_app SELinux domain (no system_file:execmod). */
+static void _hybris_hook___cfi_slowpath(uint64_t CallSiteTypeId, void *TargetAddr)
+{
+    (void)CallSiteTypeId;
+    (void)TargetAddr;
+}
+
+static void _hybris_hook___cfi_slowpath_diag(uint64_t CallSiteTypeId, void *TargetAddr, void *DiagData)
+{
+    (void)CallSiteTypeId;
+    (void)TargetAddr;
+    (void)DiagData;
+}
+
 // old property hooks for pre-android 8 approach
 static struct _hook hooks_properties[] = {
     HOOK_INDIRECT(property_get),
@@ -3355,6 +3378,9 @@ static struct _hook hooks_common[] = {
 };
 
 static struct _hook hooks_mm[] = {
+    /* CFI was added in Android M (API 23). See cfi stub definitions above. */
+    HOOK_TO(__cfi_slowpath, _hybris_hook___cfi_slowpath),
+    HOOK_TO(__cfi_slowpath_diag, _hybris_hook___cfi_slowpath_diag),
     HOOK_DIRECT(strtol),
     HOOK_DIRECT_NO_DEBUG(strlcat),
     HOOK_DIRECT_NO_DEBUG(strlcpy),
