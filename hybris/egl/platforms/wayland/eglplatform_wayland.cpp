@@ -288,6 +288,7 @@ struct ws_module ws_module_info = {
 	waylandws_setSwapInterval,
 	waylandws_releaseDisplay,
 	waylandws_eglInitialized,
+	NULL, /* eglGetConfigAttrib (X11-only override; falls through) */
 };
 
 
