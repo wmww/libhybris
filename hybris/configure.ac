@@ -93,6 +93,17 @@ AC_ARG_ENABLE(wayland,
   [wayland="no"])
 AM_CONDITIONAL( [WANT_WAYLAND], [test x"$wayland" = x"yes"])
 
+AC_ARG_ENABLE(x11,
+  [  --enable-x11                Enable X11 EGL platform via TAWC-DRI (default=disabled)],
+  [x11=$enableval
+	PKG_CHECK_MODULES(X11, x11,, exit)
+	PKG_CHECK_MODULES(XCB, xcb,, exit)
+	PKG_CHECK_MODULES(X11_XCB, x11-xcb,, exit)
+	AC_DEFINE(WANT_X11, [], [We want X11 EGL platform support])
+],
+  [x11="no"])
+AM_CONDITIONAL( [WANT_X11], [test x"$x11" = x"yes"])
+
 AC_ARG_ENABLE(glvnd,
   [  --enable-glvnd                                 Enable GLVND support])
 AM_CONDITIONAL( [WANT_GLVND], [test "$enable_glvnd" = "yes"])
@@ -316,6 +327,7 @@ AC_CONFIG_FILES([
 	egl/platforms/null/Makefile
 	egl/platforms/fbdev/Makefile
 	egl/platforms/wayland/Makefile
+	egl/platforms/x11/Makefile
 	egl/platforms/hwcomposer/Makefile
 	egl/platforms/hwcomposer/hwcomposer-egl.pc
 	glesv1/glesv1_cm.pc

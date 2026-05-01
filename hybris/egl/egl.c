@@ -241,6 +241,12 @@ EGLDisplay __eglHybrisGetPlatformDisplayCommon(EGLenum platform,
 			break;
 #endif
 
+#ifdef WANT_X11
+		case EGL_PLATFORM_X11_KHR:
+			hybris_ws = "x11";
+			break;
+#endif
+
 		default:
 			__eglHybrisSetError(EGL_BAD_PARAMETER);
 			return EGL_NO_DISPLAY;
@@ -329,7 +335,21 @@ const char * eglQueryString(EGLDisplay dpy, EGLint name)
 
 HYBRIS_IMPLEMENT_FUNCTION4(egl, EGLBoolean, eglGetConfigs, EGLDisplay, EGLConfig *, EGLint, EGLint *);
 HYBRIS_IMPLEMENT_FUNCTION5(egl, EGLBoolean, eglChooseConfig, EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLint *);
-HYBRIS_IMPLEMENT_FUNCTION4(egl, EGLBoolean, eglGetConfigAttrib, EGLDisplay, EGLConfig, EGLint, EGLint *);
+EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute, EGLint *value)
+{
+	/* Let the active platform plugin override the attribute first.
+	 * This is how the X11 plugin substitutes a real X visual ID for
+	 * EGL_NATIVE_VISUAL_ID — Android EGL otherwise hands back a HAL
+	 * pixel-format constant that no X visual matches, breaking
+	 * standard EGL-X11 toolchains (es2gears_x11, glmark2, …). */
+	struct _EGLDisplay *display = hybris_egl_display_get_mapping(dpy);
+	if (display && ws_eglGetConfigAttrib(display, config, attribute, value))
+		return EGL_TRUE;
+
+	static EGLBoolean (*f)(EGLDisplay, EGLConfig, EGLint, EGLint *) FP_ATTRIB = NULL;
+	HYBRIS_DLSYSM(egl, &f, "eglGetConfigAttrib");
+	return f(dpy, config, attribute, value);
+}
 
 EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
 		EGLNativeWindowType win,

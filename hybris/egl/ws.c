@@ -202,4 +202,12 @@ void ws_setSwapInterval(EGLDisplay dpy, EGLNativeWindowType win, EGLint interval
 		ws->setSwapInterval(dpy, win, interval);
 }
 
+EGLBoolean ws_eglGetConfigAttrib(struct _EGLDisplay *dpy, EGLConfig config,
+                                 EGLint attribute, EGLint *out_value)
+{
+	if (ws == NULL || ws->eglGetConfigAttrib == NULL)
+		return EGL_FALSE;
+	return ws->eglGetConfigAttrib(dpy, config, attribute, out_value);
+}
+
 // vim:ts=4:sw=4:noexpandtab
