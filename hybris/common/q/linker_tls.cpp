@@ -40,7 +40,14 @@
 #include "private/linker_native_bridge.h"
 #include "linker_main.h"
 #include "linker_soinfo.h"
+#include "tls_patcher.h"
 #include <stdint.h>
+
+// Set by linker_main.cpp from android_linker_init(); we read its
+// init_static_tls_for_thread to push .tdata into the promoting thread's
+// tls_static_tls (and to register the module for catch-up replay on
+// later-touched threads -- see hooks.c::g_promoted_tls).
+extern hybris_tls_patcher_funcs_t _tls_patcher_funcs;
 
 __LIBC_HIDDEN__ _Atomic(size_t) __libc_tls_generation_copy = {SIZE_MAX};
 
@@ -49,7 +56,17 @@ static std::vector<TlsModule> g_tls_modules;
 
 static size_t get_unused_module_index() {
   for (size_t i = 0; i < g_tls_modules.size(); ++i) {
-    if (g_tls_modules[i].soinfo_ptr == nullptr) {
+    // Only recycle slots that unregistered cleanly back to dynamic — never
+    // reuse a slot whose static_offset still holds a real reservation.
+    // unregister_tls_module()'s static path leaves static_offset intact so
+    // any live thread DTV's `static_tls + offset` pointer at this slot
+    // stays valid; if we recycled and a future register dropped the slot
+    // back to SIZE_MAX, that pointer would route through the dynamic-free
+    // path in update_tls_dtv() / __free_dynamic_tls() and be passed to
+    // BionicAllocator::free — heap corruption (the pointer is into TCB
+    // static-TLS memory, not allocator-owned).
+    if (g_tls_modules[i].soinfo_ptr == nullptr &&
+        g_tls_modules[i].static_offset == SIZE_MAX) {
       return i;
     }
   }
@@ -85,18 +102,49 @@ static void register_tls_module(soinfo* si, size_t static_offset) {
 }
 
 static void unregister_tls_module(soinfo* si) {
+  TlsModules& libc_modules = __libc_shared_globals()->tls_modules;
+
   ScopedSignalBlocker ssb;
-  ScopedWriteLock locker(&__libc_shared_globals()->tls_modules.rwlock);
+  ScopedWriteLock locker(&libc_modules.rwlock);
 
   soinfo_tls* si_tls = si->get_tls();
   TlsModule& mod = g_tls_modules[__tls_module_id_to_idx(si_tls->module_id)];
-  CHECK(mod.static_offset == SIZE_MAX);
   CHECK(mod.soinfo_ptr == si);
-  mod = {};
+
+  // No generation bump. Upstream bionic doesn't bump here either: the
+  // signal "this slot died" is `mod = {}` setting first_generation =
+  // kTlsGenerationNone (dynamic path) or static_offset staying != SIZE_MAX
+  // (static path); update_tls_dtv reads those, not libc_modules.generation.
+  // Under libhybris there's no consumer at all -- bionic TLS access goes
+  // through the thunk-patched MRS, not __tls_get_addr -> update_tls_dtv.
+  if (mod.static_offset == SIZE_MAX) {
+    // Dynamic: clean fast path. Slot fully recycles in
+    // get_unused_module_index() (gated on static_offset == SIZE_MAX).
+    mod = {};
+  } else {
+    // Promoted to static at IE relocation time. Detach the soinfo and
+    // mark the slot permanent (get_unused_module_index() will skip it),
+    // but keep static_offset/segment/first_generation intact so:
+    //   - update_tls_dtv() keeps treating dtv->modules[i] = static_tls + off
+    //     for any thread that still has a stale DTV; reading stale (but
+    //     mapped) static-TLS bytes is harmless. Recycling and flipping
+    //     back to SIZE_MAX would route a static_tls pointer through the
+    //     dynamic-free path — see get_unused_module_index() comment.
+    //   - __free_dynamic_tls() at thread exit takes its
+    //     "static_offset != SIZE_MAX -> skip free" branch (bionic_elf_tls.cpp).
+    // Cost: the slot index AND the reserved bytes in static_tls_layout
+    // leak. In libhybris this only fires for IE-model libs (apex libc et
+    // al.), which transitively unload at most once per process and are
+    // typically pinned for life.
+    mod.soinfo_ptr = nullptr;
+  }
   si_tls->module_id = kTlsUninitializedModuleId;
 }
 
-// The reference is valid until a TLS module is registered or unregistered.
+// The reference is valid until a TLS module is registered, unregistered,
+// or promoted (promote_tls_module_to_static() mutates the entry under
+// rwlock; callers without the lock should copy fields by value, not
+// retain the reference).
 const TlsModule& get_tls_module(size_t module_id) {
   size_t module_idx = __tls_module_id_to_idx(module_id);
   CHECK(module_idx < g_tls_modules.size());
@@ -136,12 +184,77 @@ void register_soinfo_tls(soinfo* si) {
   if (si_tls == nullptr || si_tls->module_id != kTlsUninitializedModuleId) {
     return;
   }
-  size_t static_offset = SIZE_MAX;
-  if (!g_static_tls_finished) {
-    StaticTlsLayout& layout = __libc_shared_globals()->static_tls_layout;
-    static_offset = layout.reserve_solib_segment(si_tls->segment);
+  // Reserve bionic_tcb at offset 0 of the static-TLS layout on the first
+  // TLS-using soinfo we ever see, before any link_image() in this batch
+  // calls relocate(). This keeps offset_thread_pointer() stable from
+  // that moment on, so soinfo::relocate can read it into tls_tp_base
+  // unconditionally at the top of the function. Mirrors what
+  // linker_setup_exe_static_tls would do for an exe; libhybris has none.
+  // The reservation holds tls_modules.rwlock briefly, then drops it
+  // before register_tls_module re-takes it. The gap is safe because
+  // the outer g_dl_mutex (held by every hybris_dlopen path that reaches
+  // here) already serialises mutation of the static_tls_layout.
+  StaticTlsLayout& layout = __libc_shared_globals()->static_tls_layout;
+  if (layout.offset_bionic_tcb() == SIZE_MAX) {
+    ScopedSignalBlocker ssb;
+    ScopedWriteLock locker(&__libc_shared_globals()->tls_modules.rwlock);
+    layout.reserve_exe_segment_and_tcb(nullptr, "");
   }
-  register_tls_module(si, static_offset);
+  // Always register as dynamic (SIZE_MAX). In standard bionic this branch
+  // would reserve a static-TLS slot for executable bootstrap deps before
+  // linker_finalize_static_tls() flips g_static_tls_finished. libhybris has
+  // no executable, so finalize is never called and EVERY load would otherwise
+  // claim a static slot it can never give back. Instead, the IE TLS
+  // relocation path (linker.cpp:R_GENERIC_TLS_TPREL) lazy-promotes via
+  // promote_tls_module_to_static() the few libs that actually need a fixed
+  // tp-relative offset (apex libc et al.). Everything else stays dynamic
+  // and dlclose() recycles the slot cleanly.
+  register_tls_module(si, SIZE_MAX);
+}
+
+size_t promote_tls_module_to_static(soinfo* si) {
+  ScopedSignalBlocker ssb;
+  ScopedWriteLock locker(&__libc_shared_globals()->tls_modules.rwlock);
+
+  // We're growing the static-TLS layout. linker_finalize_static_tls() is
+  // never called in the libhybris flow today (linker_main is dead code),
+  // but if a future change wires it up, reserving after finalize would
+  // silently corrupt the layout — make it loud instead.
+  CHECK(!g_static_tls_finished);
+
+  soinfo_tls* si_tls = si->get_tls();
+  CHECK(si_tls != nullptr);
+  CHECK(si_tls->module_id != kTlsUninitializedModuleId);
+  TlsModule& mod = g_tls_modules[__tls_module_id_to_idx(si_tls->module_id)];
+  CHECK(mod.soinfo_ptr == si);
+  if (mod.static_offset == SIZE_MAX) {
+    StaticTlsLayout& layout = __libc_shared_globals()->static_tls_layout;
+    mod.static_offset = layout.reserve_solib_segment(si_tls->segment);
+    // Bump generation so threads update their DTV from "dynamic, unallocated"
+    // to "static at this offset" on next access.
+    TlsModules& libc_modules = __libc_shared_globals()->tls_modules;
+    const size_t new_generation = ++libc_modules.generation;
+    __libc_tls_generation_copy = new_generation;
+    if (libc_modules.generation_libc_so != nullptr) {
+      *libc_modules.generation_libc_so = new_generation;
+    }
+    mod.first_generation = new_generation;
+
+    // Hand the (offset, .tdata copy, sizes) tuple to hooks.c: it
+    // memcpy's .tdata into the promoting thread's tls_static_tls and
+    // appends an entry to its registry so any thread that later
+    // first-touches bionic state via _hybris_hook___get_tls_hooks can
+    // replay the init. hooks owns the .tdata bytes after this call --
+    // segment.init_ptr stays valid only while the .so is mapped.
+    if (_tls_patcher_funcs.init_static_tls_for_thread != nullptr) {
+      _tls_patcher_funcs.init_static_tls_for_thread(
+          mod.static_offset,
+          si_tls->segment.init_ptr,
+          si_tls->segment.init_size,
+          si_tls->segment.size);
+    }
+  }
+  return mod.static_offset;
 }
 
 void unregister_soinfo_tls(soinfo* si) {
