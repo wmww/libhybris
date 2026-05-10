@@ -28,6 +28,14 @@ stamp-h1
 aclocal-copy
 arm-*-linux-gnueabi-libtool
 
+# autoreconf copies these into hybris/ on configure
+hybris/COPYING
+hybris/INSTALL
+
+# autotools editor/backup droppings and the tawc build's configure stamp
+configure~
+hybris/.tawc-configure-stamp
+
 # Generated .pc, .h and .c files
 hybris/camera/libcamera.pc
 hybris/documentation.list
