@@ -43,6 +43,16 @@ void unregister_soinfo_tls(soinfo* si);
 
 const TlsModule& get_tls_module(size_t module_id);
 
+// Lazy-promote an already-registered (and SIZE_MAX) TLS module to a real
+// static-TLS offset. Used by the IE TLS relocation path (R_GENERIC_TLS_TPREL)
+// in libhybris, where register_soinfo_tls() defers the static-vs-dynamic
+// choice until relocation reveals an IE-model access. Returns the
+// resulting static_offset. Idempotent: a second call once the slot is
+// already non-SIZE_MAX is a no-op that returns the existing offset.
+// Takes the libc tls_modules rwlock; serialises with
+// tls_get_addr_slow_path / update_tls_dtv on other threads.
+size_t promote_tls_module_to_static(soinfo* si);
+
 typedef size_t TlsDescResolverFunc(size_t);
 
 struct TlsDescriptor {
