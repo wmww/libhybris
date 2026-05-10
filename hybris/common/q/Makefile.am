@@ -69,7 +69,10 @@ q_la_LDFLAGS = \
 	-lpthread \
 	-lsupc++ \
 	-module \
-	-avoid-version
+	-avoid-version \
+	-Wl,--version-script,$(srcdir)/q.ver
+
+EXTRA_DIST = q.ver
 
 if WANT_DEBUG
 q_la_CPPFLAGS += \
