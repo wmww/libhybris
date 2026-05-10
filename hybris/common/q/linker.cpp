@@ -3188,14 +3188,16 @@ bool soinfo::relocate(const VersionTracker& version_tracker, ElfRelIteratorT&& r
             // &weak_tls_symbol to __get_tls().
           } else {
             CHECK(lsi->get_tls() != nullptr); // We rejected a missing TLS segment above.
-            const TlsModule& mod = get_tls_module(lsi->get_tls()->module_id);
-            if (mod.static_offset != SIZE_MAX) {
-              tpoff += mod.static_offset - tls_tp_base;
-            } else {
-              DL_ERR("TLS symbol \"%s\" in dlopened \"%s\" referenced from \"%s\" using IE access model",
-                     sym_name, lsi->get_realpath(), get_realpath());
-              return false;
+            // libhybris registers every TLS module as dynamic (SIZE_MAX) up
+            // front and lazy-promotes here on first IE-model access. apex
+            // libc.so is the canonical IE user (errno et al.); promoting on
+            // demand keeps the static-TLS layout from leaking a slot for
+            // every dlopen-class load we'll never need to pin.
+            size_t static_offset = get_tls_module(lsi->get_tls()->module_id).static_offset;
+            if (static_offset == SIZE_MAX) {
+              static_offset = promote_tls_module_to_static(lsi);
             }
+            tpoff += static_offset - tls_tp_base;
           }
           tpoff += sym_addr + addend;
           TRACE_TYPE(RELO, "RELO TLS_TPREL %16p <- %16p %s\n",
