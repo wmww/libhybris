@@ -27,12 +27,22 @@ extern "C" {
 typedef void (*hybris_tls_patcher_t)(void* segment_addr, size_t segment_size, const char* library_name);
 typedef void (*hybris_register_thunk_region_t)(void* start, size_t size);
 typedef size_t (*hybris_count_tls_t)(void* segment_addr, size_t segment_size);
+/* Copy a TLS-using bionic .so's .tdata initial values into the calling
+ * thread's bionic static-TLS area at the given static_offset (the value
+ * returned by StaticTlsLayout::reserve_solib_segment). The linker calls
+ * this from promote_tls_module_to_static() so the registering thread
+ * sees the correct initial values for `__thread` variables in the
+ * dlopened bionic .so. Other threads see zeros for that module unless
+ * they also pass through hybris init (e.g. _hybris_thread_wrapper or a
+ * hooked bionic libc call routed through _hybris_hook___get_tls_hooks). */
+typedef void (*hybris_init_static_tls_for_thread_t)(size_t static_offset, const void* init_ptr, size_t init_size);
 
 /* Function pointers passed from hooks.c to the Android linker */
 struct hybris_tls_patcher_funcs {
     hybris_tls_patcher_t patch_tls;
     hybris_register_thunk_region_t register_thunk_region;
     hybris_count_tls_t count_tls;
+    hybris_init_static_tls_for_thread_t init_static_tls_for_thread;
 };
 typedef struct hybris_tls_patcher_funcs hybris_tls_patcher_funcs_t;
 

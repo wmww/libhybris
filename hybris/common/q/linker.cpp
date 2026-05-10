@@ -2909,7 +2909,22 @@ static bool is_tls_reloc(ElfW(Word) type) {
 template<typename ElfRelIteratorT>
 bool soinfo::relocate(const VersionTracker& version_tracker, ElfRelIteratorT&& rel_iterator,
                       const soinfo_list_t& global_group, const soinfo_list_t& local_group) {
-  const size_t tls_tp_base = 0/*__libc_shared_globals()->static_tls_layout.offset_thread_pointer()*/;
+  // Hardcoded to match what offset_thread_pointer() returns AFTER the
+  // first promote_tls_module_to_static() reserves bionic_tcb at offset
+  // 0 (offset_bionic_tcb_ + (-MIN_TLS_SLOT * sizeof(void*)) = 0 + 16
+  // for aarch64 with MIN_TLS_SLOT=-2). We can't read offset_thread_pointer()
+  // here because relocate() runs the lookup once at the top, before any
+  // R_GENERIC_TLS_TPREL/TLSDESC handler triggers the reservation -- on
+  // the first promote, offset_bionic_tcb_ is still SIZE_MAX and the
+  // computation would wrap. The TLSDESC/IE handlers further down then
+  // do (`static_offset - tls_tp_base`); with this constant, per-.so
+  // static_offsets (which start at 80 = sizeof(bionic_tcb) post-reservation)
+  // produce the same tp-relative byte offsets bionic's __tls_get_addr
+  // would, and the thunk-patched MRS lands the access on the right byte
+  // of tls_static_tls (where hooks.c memcpy'd the .tdata at the matching
+  // static_offset). x86_64 TLSDESC is unimplemented in libhybris, so the
+  // 16-only constant is fine for the only platform that exercises this.
+  const size_t tls_tp_base = 16;
   std::vector<std::pair<TlsDescriptor*, size_t>> deferred_tlsdesc_relocs;
 
   for (size_t idx = 0; rel_iterator.has_next(); ++idx) {
@@ -3188,14 +3203,16 @@ bool soinfo::relocate(const VersionTracker& version_tracker, ElfRelIteratorT&& r
             // &weak_tls_symbol to __get_tls().
           } else {
             CHECK(lsi->get_tls() != nullptr); // We rejected a missing TLS segment above.
-            const TlsModule& mod = get_tls_module(lsi->get_tls()->module_id);
-            if (mod.static_offset != SIZE_MAX) {
-              tpoff += mod.static_offset - tls_tp_base;
-            } else {
-              DL_ERR("TLS symbol \"%s\" in dlopened \"%s\" referenced from \"%s\" using IE access model",
-                     sym_name, lsi->get_realpath(), get_realpath());
-              return false;
+            // libhybris registers every TLS module as dynamic (SIZE_MAX) up
+            // front and lazy-promotes here on first IE-model access. apex
+            // libc.so is the canonical IE user (errno et al.); promoting on
+            // demand keeps the static-TLS layout from leaking a slot for
+            // every dlopen-class load we'll never need to pin.
+            size_t static_offset = get_tls_module(lsi->get_tls()->module_id).static_offset;
+            if (static_offset == SIZE_MAX) {
+              static_offset = promote_tls_module_to_static(lsi);
             }
+            tpoff += static_offset - tls_tp_base;
           }
           tpoff += sym_addr + addend;
           TRACE_TYPE(RELO, "RELO TLS_TPREL %16p <- %16p %s\n",
@@ -3250,28 +3267,29 @@ bool soinfo::relocate(const VersionTracker& version_tracker, ElfRelIteratorT&& r
                        reinterpret_cast<void*>(reloc), static_cast<size_t>(addend), sym_name);
           } else {
             CHECK(lsi->get_tls() != nullptr); // We rejected a missing TLS segment above.
-            size_t module_id = lsi->get_tls()->module_id;
-            const TlsModule& mod = get_tls_module(module_id);
-            if (mod.static_offset != SIZE_MAX) {
-              desc->func = tlsdesc_resolver_static;
-              desc->arg = mod.static_offset - tls_tp_base + sym_addr + addend;
-              TRACE_TYPE(RELO, "RELO TLSDESC %16p <- static (0x%zx - 0x%zx + 0x%zx + 0x%zx) %s\n",
-                         reinterpret_cast<void*>(reloc), mod.static_offset, tls_tp_base,
-                         static_cast<size_t>(sym_addr), static_cast<size_t>(addend), sym_name);
-            } else {
-              TlsDynamicResolverArg arg;
-              arg.generation = mod.first_generation;
-              arg.index.module_id = module_id;
-              arg.index.offset = sym_addr + addend;
-              tlsdesc_args_.push_back(arg);
-              // Defer the TLSDESC relocation until the address of the TlsDynamicResolverArg object
-              // is finalized.
-              deferred_tlsdesc_relocs.push_back({ desc, tlsdesc_args_.size() - 1 });
-              const TlsDynamicResolverArg& desc_arg = tlsdesc_args_.back();
-              TRACE_TYPE(RELO, "RELO TLSDESC %16p <- dynamic (gen %zu, mod %zu, off %zu) %s",
-                         reinterpret_cast<void*>(reloc), desc_arg.generation,
-                         desc_arg.index.module_id, desc_arg.index.offset, sym_name);
+            // libhybris: TLSDESC's dynamic slow path (tlsdesc_resolver.S
+            // -> tlsdesc_resolver_dynamic_slow_path -> __tls_get_addr)
+            // resolves __tls_get_addr against the host glibc, since
+            // libhybris_common.so links against host libc. Calling glibc's
+            // __tls_get_addr with a bionic module_id trips
+            // dl-tls.c:_dl_update_slotinfo's `max_modid >= req_modid`
+            // assertion (bionic module ids have no entry in glibc's
+            // slotinfo table). Pin every TLSDESC-using module to a real
+            // static_offset so resolution always takes the static path.
+            // Same lazy-promote machinery as the IE path
+            // (R_GENERIC_TLS_TPREL above) -- one promotion per IE-or-
+            // TLSDESC-using lib for process lifetime, in line with the
+            // pre-promotion behaviour where register_soinfo_tls reserved
+            // a static slot for every TLS-using lib unconditionally.
+            size_t static_offset = get_tls_module(lsi->get_tls()->module_id).static_offset;
+            if (static_offset == SIZE_MAX) {
+              static_offset = promote_tls_module_to_static(lsi);
             }
+            desc->func = tlsdesc_resolver_static;
+            desc->arg = static_offset - tls_tp_base + sym_addr + addend;
+            TRACE_TYPE(RELO, "RELO TLSDESC %16p <- static (0x%zx - 0x%zx + 0x%zx + 0x%zx) %s\n",
+                       reinterpret_cast<void*>(reloc), static_offset, tls_tp_base,
+                       static_cast<size_t>(sym_addr), static_cast<size_t>(addend), sym_name);
           }
         }
         break;
