@@ -2426,19 +2426,19 @@ bool do_dlsym(void* handle,
 
     if ((bind == STB_GLOBAL || bind == STB_WEAK) && sym->st_shndx != 0) {
       if (type == STT_TLS) {
-        // For a TLS symbol, dlsym returns the address of the current thread's
-        // copy of the symbol. This function may allocate a DTV and/or storage
-        // for the source TLS module. (Allocating a DTV isn't necessary if the
-        // symbol is part of static TLS, but it's simpler to reuse
-        // __tls_get_addr.)
-        soinfo_tls* tls_module = found->get_tls();
-        if (tls_module == nullptr) {
-          DL_ERR("TLS symbol \"%s\" in solib \"%s\" with no TLS segment",
-                 sym_name, found->get_realpath());
-          return false;
-        }
-        const TlsIndex ti { tls_module->module_id, sym->st_value };
-        *symbol = TLS_GET_ADDR(&ti);
+        // libhybris: refuse rather than route through q.so's __tls_get_addr,
+        // whose `mrs tpidr_el0` reads the running thread's TP register —
+        // which is glibc's, not the patched bionic TP. Returning that
+        // pointer would silently corrupt: the caller would read/write at
+        // a glibc-TLS address instead of the bionic .so's static-TLS slot.
+        // Loud guard so a regression here surfaces at the dlsym call site
+        // with a useful message rather than as random memory damage
+        // somewhere downstream.
+        DL_ERR("dlsym of TLS symbol \"%s\" in \"%s\" not supported by libhybris "
+               "(would read raw tpidr_el0 / glibc TP — see "
+               "issues/libhybris-tls-dlsym-and-weak-tlsdesc.md history)",
+               sym_name, found->get_realpath());
+        return false;
       } else {
 #ifdef WANT_ARM_TRACING
         if (_wrapping_enabled) {
@@ -3250,11 +3250,19 @@ bool soinfo::relocate(const VersionTracker& version_tracker, ElfRelIteratorT&& r
         {
           TlsDescriptor* desc = reinterpret_cast<TlsDescriptor*>(reloc);
           if (lsi == nullptr) {
-            // Unresolved weak relocation.
-            desc->func = tlsdesc_resolver_unresolved_weak;
-            desc->arg = addend;
-            TRACE_TYPE(RELO, "RELO TLSDESC %16p <- unresolved weak 0x%zx %s\n",
-                       reinterpret_cast<void*>(reloc), static_cast<size_t>(addend), sym_name);
+            // libhybris: unresolved-weak resolver in tlsdesc_resolver.S
+            // does `mrs tpidr_el0` (glibc TP) and expects the caller to
+            // add the same TP back — but the bionic-patched caller adds
+            // the patched bionic TP, so the result is bionic_tp - glibc_tp
+            // (a non-NULL nonsense pointer), not the ELF-mandated NULL.
+            // Loud guard so a vendor blob with this idiom fails at dlopen
+            // with a clear message instead of segfaulting deep inside the
+            // driver. See issues/libhybris-tls-dlsym-and-weak-tlsdesc.md
+            // history.
+            DL_ERR("unresolved weak __thread \"%s\" not supported by libhybris "
+                   "(weak TLSDESC resolver reads raw tpidr_el0 / glibc TP)",
+                   sym_name);
+            return false;
           } else {
             CHECK(lsi->get_tls() != nullptr); // We rejected a missing TLS segment above.
             // libhybris: TLSDESC's dynamic slow path (tlsdesc_resolver.S

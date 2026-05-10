@@ -186,18 +186,9 @@ ENTRY_PRIVATE(tlsdesc_resolver_dynamic_slow_path)
   ret
 END(tlsdesc_resolver_dynamic_slow_path)
 
-// The address of an unresolved weak TLS symbol evaluates to NULL with TLSDESC.
-// The value returned by this function is added to the thread pointer, so return
-// a negated thread pointer to cancel it out.
-ENTRY_PRIVATE(tlsdesc_resolver_unresolved_weak)
-  str x19, [sp, #-16]!
-  .cfi_def_cfa_offset 16
-  .cfi_rel_offset x19, 0
-  ldr x19, [x0, #8]
-  mrs x0, tpidr_el0             // __get_tls()
-  sub x0, x19, x0
-  ldr x19, [sp], #16
-  .cfi_def_cfa_offset 0
-  .cfi_restore x19
-  ret
-END(tlsdesc_resolver_unresolved_weak)
+// libhybris removed the upstream tlsdesc_resolver_unresolved_weak: the
+// resolver's `mrs tpidr_el0` returns glibc's TP, but the bionic-patched
+// caller adds the bionic TP, yielding a non-NULL nonsense pointer
+// instead of the ELF-mandated NULL. Unresolved-weak TLSDESC relocations
+// are now refused at hybris_dlopen time in linker.cpp's R_GENERIC_TLSDESC
+// handler.
