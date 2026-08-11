@@ -108,7 +108,11 @@ static const char* const kLdConfigFilePath = "/system/etc/ld.config.txt";
 static const char* const kLdConfigVndkLiteFilePath = "/system/etc/ld.config.vndk_lite.txt";
 
 #ifdef HAS_ANDROID_11_0_0
-static const char* const kLdGeneratedConfigFilePath = "/linkerconfig/ld.config.txt";
+// TAWC: Android's boot-generated config lives at /linkerconfig/ld.config.txt,
+// but the tawc rootfs no longer binds that directory in (its SELinux label
+// denies dir getattr to app domains, which breaks `ls -l /` in the guest).
+// tawc copies the file to this path inside the rootfs at each spawn instead.
+static const char* const kLdGeneratedConfigFilePath = "/usr/lib/hybris-config/ld.config.txt";
 #endif
 
 #if defined(__LP64__)
