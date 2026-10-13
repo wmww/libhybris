@@ -175,6 +175,57 @@ extern "C" void waylandws_Terminate(_EGLDisplay *dpy)
 	}
 }
 
+// A wl_surface from a connection other than the EGLDisplay's own one. All
+// eglGetDisplay calls share one Android display, so a process with several
+// wl_displays (e.g. Qt plus GDK from the gtk3 platform theme) still has only
+// the first one's queue and android_wlegl here. Such windows bind their own
+// android_wlegl on the surface's connection and drop it with the window.
+class ForeignWaylandNativeWindow : public WaylandNativeWindow {
+public:
+	ForeignWaylandNativeWindow(struct wl_egl_window *win, struct wl_display *display, android_wlegl *wlegl)
+		: WaylandNativeWindow(win, display, wlegl), m_owned_wlegl(wlegl) {}
+	~ForeignWaylandNativeWindow() { android_wlegl_destroy(m_owned_wlegl); }
+
+private:
+	android_wlegl *m_owned_wlegl;
+};
+
+static void foreign_registry_handle_global(void *data, wl_registry *registry, uint32_t name, const char *interface, uint32_t version)
+{
+	android_wlegl **wlegl = (android_wlegl **)data;
+
+	if (strcmp(interface, "android_wlegl") == 0 && !*wlegl) {
+		*wlegl = static_cast<struct android_wlegl *>(wl_registry_bind(registry, name, &android_wlegl_interface, std::min(2u, version)));
+	}
+}
+
+static void foreign_registry_handle_global_remove(void *, wl_registry *, uint32_t)
+{
+}
+
+static const wl_registry_listener foreign_registry_listener = {
+	foreign_registry_handle_global,
+	foreign_registry_handle_global_remove,
+};
+
+static android_wlegl *bind_wlegl(wl_display *dpy)
+{
+	android_wlegl *wlegl = NULL;
+	wl_event_queue *queue = wl_display_create_queue(dpy);
+	wl_display *wrapper = (wl_display *) wl_proxy_create_wrapper(dpy);
+	wl_proxy_set_queue((wl_proxy *) wrapper, queue);
+	wl_registry *registry = wl_display_get_registry(wrapper);
+	wl_registry_add_listener(registry, &foreign_registry_listener, &wlegl);
+	wl_display_roundtrip_queue(dpy, queue);
+	wl_registry_destroy(registry);
+	wl_proxy_wrapper_destroy(wrapper);
+	// android_wlegl has no events; move it off the queue before freeing it.
+	if (wlegl)
+		wl_proxy_set_queue((wl_proxy *) wlegl, NULL);
+	wl_event_queue_destroy(queue);
+	return wlegl;
+}
+
 extern "C" EGLNativeWindowType waylandws_CreateWindow(EGLNativeWindowType win, _EGLDisplay *display)
 {
 	struct wl_egl_window *wl_window = (struct wl_egl_window*) win;
@@ -196,7 +247,18 @@ extern "C" EGLNativeWindowType waylandws_CreateWindow(EGLNativeWindowType win, _
 	}
 	assert(ret >= 0);
 
-	WaylandNativeWindow *window = new WaylandNativeWindow((struct wl_egl_window *) win, wdpy->wl_dpy, wdpy->wlegl);
+	WaylandNativeWindow *window;
+	struct wl_display *surface_dpy = wl_proxy_get_display((struct wl_proxy *) wl_window->surface);
+	if (surface_dpy == wdpy->wl_dpy) {
+		window = new WaylandNativeWindow(wl_window, wdpy->wl_dpy, wdpy->wlegl);
+	} else {
+		struct android_wlegl *wlegl = bind_wlegl(surface_dpy);
+		if (!wlegl) {
+			fprintf(stderr, "Fatal: the server doesn't advertise the android_wlegl global on a secondary connection!");
+			abort();
+		}
+		window = new ForeignWaylandNativeWindow(wl_window, surface_dpy, wlegl);
+	}
 	window->common.incRef(&window->common);
 	return (EGLNativeWindowType) static_cast<struct ANativeWindow *>(window);
 }
